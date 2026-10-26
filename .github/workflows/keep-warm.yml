@@ -1,0 +1,45 @@
+# Keep-warm pinger for the free Render web service.
+#
+# Render's free tier sleeps after ~15 minutes without traffic, and the
+# first request after sleep takes 30-60s. This workflow curls the public,
+# no-auth /health endpoint every 10 minutes so the instance normally
+# never sleeps — students open the app and it answers immediately.
+#
+# Setup (once, in the backend repo on GitHub):
+#   Settings -> Secrets and variables -> Variables -> New repository
+#   variable:  name = RENDER_URL, value = https://<service>.onrender.com
+#   (no trailing slash, no secret — the URL is public anyway).
+#
+# If RENDER_URL is not set yet, the job skips cleanly (exit 0) instead of
+# failing — so committing this file before the first deploy is safe.
+#
+# Honest limits (see README.md): the first request right after a deploy
+# or a restart can still be slow; if this pinger ever stops for 15+
+# minutes (Actions disabled, repo paused), the instance sleeps again and
+# the next student waits ~30-60s once. The permanent fix is Render
+# Starter (~$7/month, one-click upgrade, no rebuild).
+
+name: Keep Render warm (one-time setup)
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health (skip cleanly if RENDER_URL is not set)
+        env:
+          RENDER_URL: ${{ vars.RENDER_URL }}
+        run: |
+          if [ -z "$RENDER_URL" ]; then
+            echo "RENDER_URL variable is not set yet — skipping (this is not a failure)."
+            exit 0
+          fi
+          echo "Pinging $RENDER_URL/health ..."
+          curl -fsS -m 30 "$RENDER_URL/health" || {
+            echo "Ping failed (the service may be restarting after a deploy) — not failing the job."
+            exit 0
+          }
