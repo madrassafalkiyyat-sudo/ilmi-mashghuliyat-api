@@ -53,21 +53,29 @@ router.get('/users/search', async (req, res) => {
 // POST /api/admin/users/:id/approve|reject|incomplete — the three admin
 // decisions. 'incomplete' records the reason; the notification is created
 // with a deterministic id so a retry cannot duplicate it.
+// INCOMPLETE KEEPS STATUS: the old app kept an 'incomplete' student at
+// status 'pending' with a separate incomplete marker object ({reason,
+// note, at, state:'awaiting'}) — the UI reads u.incomplete.reason/state
+// and routes on status !== 'approved'. Overwriting status to the literal
+// string 'incomplete' would drop the student from the pending filter and
+// lose the reason, so incomplete NEVER changes status here.
 async function decide(req, res, status) {
   const db = await getDb();
   const id = req.params.id;
   const reason = (req.body && req.body.reason) || '';
+  const note = (req.body && req.body.note) || '';
   const user = await db.collection('users').findOne({ _id: id });
   if (!user) return fail(res, 404, 'not_found', 'طالب علم نہیں ملا');
-  const update = { $set: { status } };
+  const update = { $set: {} };
   if (status === 'incomplete') {
-    update.$set.incomplete = true;
+    update.$set.incomplete = { reason, note, at: new Date().toISOString(), state: 'awaiting' };
     update.$set.incompleteReason = reason;
     update.$set.visionReview = {
       ...(user.visionReview || {}), decision: 'incomplete', source: 'admin',
       at: new Date().toISOString(), reason,
     };
   } else {
+    update.$set.status = status;
     update.$set.incomplete = false;
   }
   await db.collection('users').updateOne({ _id: id }, update);
@@ -84,12 +92,51 @@ async function decide(req, res, status) {
     },
     { upsert: true }
   );
-  return res.json({ ok: true, status });
+  // For incomplete the stored status is unchanged (still pending) — report
+  // that, not the decision name, so API clients never see a phantom status.
+  return res.json({ ok: true, status: status === 'incomplete' ? user.status : status });
 }
 
 router.post('/users/:id/approve', (req, res) => decide(req, res, 'approved'));
 router.post('/users/:id/reject', (req, res) => decide(req, res, 'rejected'));
 router.post('/users/:id/incomplete', (req, res) => decide(req, res, 'incomplete'));
+
+// POST /api/admin/users/:id/clear-incomplete — admin accepts the student's
+// fix (UI: adminResolveIncomplete). Clears the marker; status untouched.
+router.post('/users/:id/clear-incomplete', async (req, res) => {
+  const db = await getDb();
+  const user = await db.collection('users').findOne({ _id: req.params.id });
+  if (!user) return fail(res, 404, 'not_found', 'طالب علم نہیں ملا');
+  await db.collection('users').updateOne(
+    { _id: req.params.id },
+    { $set: { incomplete: null, incompleteReason: '' } }
+  );
+  return res.json({ ok: true });
+});
+
+// POST /api/admin/notify — admin-side notification fan-out (the UI's
+// pushNotification/notifyAllApproved/notifyDecision calls). Admin-only,
+// upserted by (email, id) so a retry cannot duplicate. This is the bridge
+// target for admin-context notification writes; student-context writes
+// stay server-owned and are never accepted from the client.
+router.post('/notify', async (req, res) => {
+  const doc = (req.body && req.body.doc) || {};
+  if (!doc.email || !doc.title) return fail(res, 400, 'bad_request', 'ای میل اور عنوان درکار ہیں');
+  const db = await getDb();
+  const id = doc.id || `n${Date.now().toString(36)}`;
+  await db.collection('notifications').updateOne(
+    { email: String(doc.email).toLowerCase(), id },
+    {
+      $setOnInsert: {
+        _id: id, id, email: String(doc.email).toLowerCase(),
+        title: doc.title, body: doc.body || '', kind: doc.kind || 'general',
+        date: doc.date || new Date().toISOString(), read: false,
+      },
+    },
+    { upsert: true }
+  );
+  return res.json({ ok: true, id });
+});
 
 // POST /api/admin/users/:id/book-grant — admin book exception
 // (user.bookAccess = true). Mirrors the old individual-exception action.

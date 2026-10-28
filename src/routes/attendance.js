@@ -50,6 +50,19 @@ router.get('/mine', async (req, res) => {
   });
 });
 
+// POST /api/attendance/course-register — Idara Sazi course registration
+// (UI: course-register view sets user.courseReg). The bridge routes the
+// UI's courseReg write here; without it the book/course-final gates,
+// which require courseReg, could never open from the UI.
+router.post('/course-register', async (req, res) => {
+  const db = await getDb();
+  const user = await db.collection('users').findOne({ _id: req.user._id });
+  const set = { courseReg: true };
+  if (!user.courseRegAt) set.courseRegAt = new Date().toISOString();
+  await db.collection('users').updateOne({ _id: req.user._id }, { $set: set });
+  return res.json({ ok: true, courseReg: true });
+});
+
 // POST /api/attendance/register — register for a session (before it ends).
 // Writes BOTH shapes: the per-session map (sessionRegs.<id>) for precise
 // tracking, and the legacy boolean (sessionReg=true) that migrated docs
@@ -127,6 +140,16 @@ router.post('/verify', requireAdmin, async (req, res) => {
       { email: claim.email },
       { $set: { [`sessionAtts.${claim.sessionId}`]: true, sessionAtt: true } }
     );
+    // Session-certificate wallet card (UI: renderCert) lights on
+    // user.certIssued — but ONLY for non-course sessions. Course classes
+    // have no individual certificate (course-final only, standing rule),
+    // so course sessions must never set it.
+    const isCourse = await db.collection('courseSessions').findOne({ sessionId: claim.sessionId });
+    if (!isCourse) {
+      await db.collection('users').updateOne(
+        { email: claim.email }, { $set: { certIssued: true } }
+      );
+    }
   }
   return res.json({ ok: true, status });
 });
