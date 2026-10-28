@@ -206,7 +206,7 @@ router.get('/migration', async (req, res) => {
 // Admin list views (FRONTEND-MAP §5): read-only lists for collections the
 // admin console needs beyond /content. sessionSecrets is deliberately
 // NOT here — it has its own route below so the code path is explicit.
-const ADMIN_LISTABLE = ['sessionArchive', 'counselLogs', 'messages', 'sessionAttendees', 'competitions', 'transfers', 'starRequests', 'courseSessions', 'courses', 'starTeam', 'certificates', 'mailQueue', 'starRecommendations', 'attendanceClaims'];
+const ADMIN_LISTABLE = ['sessionArchive', 'counselLogs', 'messages', 'sessionAttendees', 'competitions', 'transfers', 'starRequests', 'courseSessions', 'courses', 'starTeam', 'certificates', 'mailQueue', 'starRecommendations', 'attendanceClaims', 'dashboardData'];
 router.get('/lists/:collection', async (req, res) => {
   const coll = req.params.collection;
   if (!ADMIN_LISTABLE.includes(coll)) return fail(res, 404, 'not_found', 'یہ مجموعہ موجود نہیں');
@@ -233,6 +233,21 @@ router.post('/lists/:collection', async (req, res) => {
   const doc = { ...data, _id: id, id };
   await db.collection(coll).updateOne({ _id: id }, { $set: doc }, { upsert: true });
   return res.status(201).json({ doc });
+});
+
+// DELETE /api/admin/lists/:collection/:id — admin deletes one raw dashboard
+// entry (the dashboard itself is never edited; only raw entries are added
+// or removed here, and the dashboards rebuild from the remaining data).
+// Same router-level auth as every other admin route (requireAuth +
+// requireAdmin); mailQueue stays read-only like on POST.
+router.delete('/lists/:collection/:id', async (req, res) => {
+  const coll = req.params.collection;
+  if (!ADMIN_LISTABLE.includes(coll) || coll === 'mailQueue') {
+    return fail(res, 404, 'not_found', 'یہ مجموعہ موجود نہیں یا صرف پڑھنے کے لیے ہے');
+  }
+  const db = await getDb();
+  await db.collection(coll).deleteOne({ _id: req.params.id });
+  return res.json({ ok: true });
 });
 
 // GET /api/admin/secrets — attendance secret codes, ADMIN ONLY.
