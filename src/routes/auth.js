@@ -160,26 +160,13 @@ router.post('/logout', async (req, res) => {
   return res.json({ ok: true });
 });
 
-// POST /api/auth/forgot-password — always answers OK (no account
-// enumeration). Actual delivery needs an email provider (OPEN-DECISIONS.md);
-// the token is stored hashed with a 1-hour expiry, never logged.
+// POST /api/auth/forgot-password — HONEST ERROR (2026-10-29): no email
+// provider is wired, so no link is ever sent. The old code answered OK and
+// stored a token, which made clients display a false "link sent" message —
+// the exact complaint behind the login crisis. Passwords are now set via the
+// re-register panel on the login screen, never via email.
 router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body || {};
-  if (email && EMAIL_RE.test(email)) {
-    const db = await getDb();
-    const user = await db.collection('users').findOne({ email: String(email).toLowerCase() });
-    if (user) {
-      const token = newRefreshToken();
-      await db.collection('users').updateOne(
-        { _id: user._id },
-        { $set: { resetTokenHash: hashToken(token), resetExpiresAt: new Date(Date.now() + 3600000).toISOString() } }
-      );
-      // TODO (provider step): send the reset link via the chosen email
-      // provider. The link target is the Pages app with ?reset=<token>.
-      // Never print the token to logs.
-    }
-  }
-  return res.json({ ok: true, message: 'اگر یہ ای میل درج ہے تو ری سیٹ لنک بھیج دیا گیا ہے' });
+  return fail(res, 501, 'email_not_configured', 'ای میل لنک کا راستہ بند ہے — لاگ ان اسکرین پر سنہری بٹن «پہلی بار نئی ایپ میں لاگ ان کریں» سے نیا پاس ورڈ بنائیں');
 });
 
 router.post('/reset-password', async (req, res) => {
@@ -197,24 +184,13 @@ router.post('/reset-password', async (req, res) => {
   return res.json({ ok: true, message: 'پاس ورڈ بدل گیا ہے' });
 });
 
-// Magic-link login (the migration bridge: works before any password is
-// set). Request stores a hashed single-use token; redeeming it issues a
-// session and immediately lets the student set a password.
+// Magic-link login — HONEST ERROR (2026-10-29): same reason as
+// forgot-password above. No email provider is wired, so no link is sent and
+// no token is stored. Staff/admins sign in with email + password (set once
+// via the re-register panel); the admin flag comes from the admins
+// collection, not from any link.
 router.post('/magic-link', async (req, res) => {
-  const { email } = req.body || {};
-  if (email && EMAIL_RE.test(email)) {
-    const db = await getDb();
-    const user = await db.collection('users').findOne({ email: String(email).toLowerCase() });
-    if (user) {
-      const token = newRefreshToken();
-      await db.collection('users').updateOne(
-        { _id: user._id },
-        { $set: { loginTokenHash: hashToken(token), loginExpiresAt: new Date(Date.now() + 3600000).toISOString() } }
-      );
-      // TODO (provider step): email the ?login=<token> link. Never log it.
-    }
-  }
-  return res.json({ ok: true, message: 'اگر یہ ای میل درج ہے تو لاگ ان لنک بھیج دیا گیا ہے' });
+  return fail(res, 501, 'email_not_configured', 'ای میل لنک کا راستہ بند ہے — لاگ ان اسکرین پر اپنی ایڈمن ای میل + نیا پاس ورڈ سے داخل ہوں (پہلی بار سنہری بٹن سے پاس ورڈ بنائیں)');
 });
 
 router.post('/magic-redeem', async (req, res) => {
