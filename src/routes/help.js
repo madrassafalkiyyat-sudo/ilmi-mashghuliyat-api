@@ -18,7 +18,7 @@ const router = express.Router();
 const MAX_QUESTION_CHARS = 2000;
 const MAX_ATTACHMENT_BYTES = Math.floor(4.5 * 1024 * 1024); // decoded, all attachments together
 const MAX_CONTEXT_CHARS = 6000; // serialized context JSON cap (grounding data, not prose)
-const UPSTREAM_TIMEOUT_MS = 50000;
+const UPSTREAM_TIMEOUT_MS = 30000;
 
 /* ---------- optional auth ----------
    A valid Bearer JWT makes the caller a "student" (higher quota).
@@ -50,6 +50,7 @@ const helpLimiter = rateLimit({
   keyGenerator: (req) => (req.helpUserId ? 'u:' + req.helpUserId : 'ip:' + req.ip),
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   handler: (req, res) => fail(res, 429, 'rate_limited', 'آج کے سوالات کی حد پوری ہو گئی ہے — براہ کرم کل دوبارہ کوشش کریں'),
 });
 
@@ -101,61 +102,78 @@ function decodedBytes(b64) {
 }
 
 /* ---------- Gemini call with model fallback ----------
-   Primary: GEMINI_MODEL env or gemini-2.5-flash. A 404 (model not
-   found for this key/region) retries the next candidate; any other
-   upstream failure is a 502 — upstream bodies are never forwarded. */
+   Candidates (env GEMINI_MODEL first): newest Flash models first —
+   this key's project reported gemini-2.5-flash as "not found" while
+   gemini-3.8-flash exists but can answer 503 (overloaded) or hang.
+   So: a 404 moves to the next candidate; a 429/5xx/timeout retries
+   the same model once, then moves on; any other HTTP error stops.
+   An overall deadline caps the whole chain. Upstream bodies and the
+   key are never forwarded to the client. */
 async function callGemini(apiKey, parts) {
-  const primary = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const primary = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
   const candidates = [];
-  [primary, 'gemini-3.8-flash', 'gemini-3.5-flash-lite'].forEach((m) => {
+  [primary, 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash'].forEach((m) => {
     if (m && !candidates.includes(m)) candidates.push(m);
   });
   const body = JSON.stringify({
     contents: [{ role: 'user', parts }],
     generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
   });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const deadline = Date.now() + 90000;
   for (let i = 0; i < candidates.length; i++) {
     const model = candidates[i];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-    let resp;
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (Date.now() > deadline) { console.error('help: overall deadline exceeded'); return null; }
+      let resp;
       try {
-        resp = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-          body,
-          signal: ctrl.signal,
-        });
-      } finally {
-        clearTimeout(timer);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
+        try {
+          resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body,
+            signal: ctrl.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch (e) {
+        console.error(`help: Gemini request failed (model ${model}, attempt ${attempt + 1}):`, e && e.message);
+        if (attempt === 0) { await sleep(1500); continue; }
+        break;
       }
-    } catch (e) {
-      console.error(`help: Gemini request failed (model ${model}):`, e && e.message);
-      return null;
+      if (resp.status === 404) {
+        console.error(`help: model ${model} not found, trying next candidate`);
+        break;
+      }
+      if (resp.status === 429 || resp.status >= 500) {
+        console.error(`help: Gemini HTTP ${resp.status} (model ${model}, attempt ${attempt + 1})`);
+        if (attempt === 0) { await sleep(1500); continue; }
+        break;
+      }
+      if (!resp.ok) {
+        console.error(`help: Gemini HTTP ${resp.status} (model ${model})`);
+        return null;
+      }
+      let data;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        console.error('help: Gemini response was not JSON');
+        return null;
+      }
+      const out = data && data.candidates && data.candidates[0] && data.candidates[0].content;
+      const texts = out && Array.isArray(out.parts)
+        ? out.parts.map((pt) => (pt && typeof pt.text === 'string' ? pt.text : '')).filter(Boolean)
+        : [];
+      const answer = texts.join('\n').trim();
+      if (answer) return answer;
+      console.error(`help: empty answer (model ${model})`);
+      break;
     }
-    if (resp.status === 404 && i < candidates.length - 1) {
-      console.error(`help: model ${model} not found, trying next candidate`);
-      continue;
-    }
-    if (!resp.ok) {
-      console.error(`help: Gemini HTTP ${resp.status} (model ${model})`);
-      return null;
-    }
-    let data;
-    try {
-      data = await resp.json();
-    } catch (e) {
-      console.error('help: Gemini response was not JSON');
-      return null;
-    }
-    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content;
-    const texts = out && Array.isArray(out.parts)
-      ? out.parts.map((p) => (p && typeof p.text === 'string' ? p.text : '')).filter(Boolean)
-      : [];
-    const answer = texts.join('\n').trim();
-    return answer || null; // empty (e.g. safety-blocked) → treated as upstream failure
   }
   return null;
 }
