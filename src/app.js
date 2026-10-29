@@ -57,6 +57,7 @@ app.use('/api/attendance', require('./routes/attendance'));
 app.use('/api/certificates', require('./routes/certificates'));
 app.use('/api/star', require('./routes/star'));
 app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/help', require('./routes/help'));
 
 // Unknown API route + last-resort error handler (never leak stack traces).
 app.use('/api', (req, res) => fail(res, 404, 'not_found', 'یہ راستہ موجود نہیں'));
