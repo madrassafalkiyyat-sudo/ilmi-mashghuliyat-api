@@ -102,17 +102,19 @@ function decodedBytes(b64) {
 }
 
 /* ---------- Gemini call with model fallback ----------
-   Candidates (env GEMINI_MODEL first): newest Flash models first —
-   this key's project reported gemini-2.5-flash as "not found" while
-   gemini-3.8-flash exists but can answer 503 (overloaded) or hang.
+   Candidates (env GEMINI_MODEL first): gemini-3.5-flash-lite leads
+   (measured 2026-10-30: gemini-3.8-flash is overloaded — 503s and
+   hangs pushed answers past 100s; the lite model answers the same
+   grounded questions in seconds). gemini-2.5-flash is "not found"
+   for this key's project.
    So: a 404 moves to the next candidate; a 429/5xx/timeout retries
    the same model once, then moves on; any other HTTP error stops.
    An overall deadline caps the whole chain. Upstream bodies and the
    key are never forwarded to the client. */
 async function callGemini(apiKey, parts) {
-  const primary = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+  const primary = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const candidates = [];
-  [primary, 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash'].forEach((m) => {
+  [primary, 'gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'].forEach((m) => {
     if (m && !candidates.includes(m)) candidates.push(m);
   });
   const body = JSON.stringify({
