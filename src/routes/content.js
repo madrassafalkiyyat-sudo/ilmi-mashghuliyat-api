@@ -7,6 +7,7 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, requireApproved, fail } = require('../middleware/auth');
+const { isExpiredGuardedDoc } = require('../lib/expiry');
 
 const router = express.Router();
 router.use(requireAuth, requireApproved);
@@ -31,7 +32,18 @@ router.get('/:collection', async (req, res) => {
   const { limit, cursor } = page(req);
   const filter = notExpiredFilter();
   if (cursor) filter._id = { $lt: cursor };
-  const docs = await db.collection(coll).find(filter).sort({ _id: -1 }).limit(limit).toArray();
+  let docs = await db.collection(coll).find(filter).sort({ _id: -1 }).limit(limit).toArray();
+  // Expiry guard (Mufti, 2026-10-31): کانفرنسز/سکالرشپس whose own
+  // deadline text has fully passed are hidden from STUDENTS even when
+  // expiresAt is missing or misleading — see lib/expiry.js for the
+  // conservative rule (latest parsed date governs; no date → visible).
+  // Admins keep seeing everything, exactly as before.
+  if (coll === 'news' && !req.isAdmin) {
+    const before = docs.length;
+    docs = docs.filter((d) => !isExpiredGuardedDoc(d));
+    const hidden = before - docs.length;
+    if (hidden > 0) console.log(`content-guard: hid ${hidden} expired conference/scholarship news item(s) from student feed`);
+  }
   return res.json({ docs, nextCursor: docs.length ? docs[docs.length - 1]._id : null });
 });
 
@@ -42,6 +54,11 @@ router.get('/:collection/:id', async (req, res) => {
   const db = await getDb();
   const doc = await db.collection(coll).findOne({ _id: req.params.id });
   if (!doc) return fail(res, 404, 'not_found', 'شے نہیں ملی');
+  // Same guard on the direct link (e.g. from an old notification):
+  // students get the ordinary not-found; admins still open the item.
+  if (coll === 'news' && !req.isAdmin && isExpiredGuardedDoc(doc)) {
+    return fail(res, 404, 'not_found', 'شے نہیں ملی');
+  }
   return res.json({ doc });
 });
 

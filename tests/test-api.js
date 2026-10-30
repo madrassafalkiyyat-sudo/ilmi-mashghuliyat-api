@@ -751,6 +751,55 @@ test('vision heal: verdict + name backfilled only where missing; idempotent; awa
   assert.equal(c2.reviewed, 0, 'second run reviews nothing — idempotent');
 });
 
+test('expiry guard: real-data deadline parsing (latest date governs, no date = visible)', async () => {
+  const { extractDates, isExpiredGuardedDoc } = require('../src/lib/expiry');
+  const TODAY = '2026-10-31';
+  // Real stored samples (Firestore export / nightly batches, Oct 2026):
+  assert.deepEqual(extractDates('بیچ 60: درخواستیں 1 تا 30 اکتوبر 2026'), ['2026-10-30']);
+  assert.deepEqual(extractDates('۳۰ اکتوبر ۲۰۲۶'), ['2026-10-30'], 'Urdu digits parse');
+  assert.equal(isExpiredGuardedDoc({ cat: 'سکالرشپس', deadline: 'بیچ 60: درخواستیں 1 تا 30 اکتوبر 2026', expiresAt: '2026-10-30' }, TODAY), true, 'IRSIP expired');
+  assert.equal(isExpiredGuardedDoc({ cat: 'سکالرشپس', deadline: 'آخری تاریخ: 28 اکتوبر 2026' }, TODAY), true, 'Fulbright expired');
+  assert.equal(isExpiredGuardedDoc({ cat: 'سکالرشپس', deadline: 'Spring/Summer 2027 راؤنڈ: 30 اکتوبر 2026 — Fall 2027 راؤنڈ: 30 مارچ 2027', expiresAt: '2026-10-30' }, TODAY), false, 'Knowledge Corridor: future round keeps it alive');
+  assert.equal(isExpiredGuardedDoc({ cat: 'سکالرشپس', deadline: '2026-10-31' }, TODAY), false, 'deadline today is not yet expired');
+  assert.equal(isExpiredGuardedDoc({ cat: 'سکالرشپس', deadline: 'سال بھر درخواستیں کھلی؛ پہلا سائیکل: اپریل کے آخر تک (اکتوبر انٹیک)' }, TODAY), false, 'no parseable date -> visible');
+  assert.equal(isExpiredGuardedDoc({ cat: 'سکالرشپس', deadline: 'درخواستیں: ہر سال 10 جنوری تا 20 فروری (TBBS) — 2027 کے لیے آخری تاریخ 20 فروری 2027' }, TODAY), false, 'future deadline visible');
+  assert.equal(isExpiredGuardedDoc({ cat: 'کورسز و تربیتی مواقع', deadline: '2026-10-01' }, TODAY), false, 'other categories are out of guard scope');
+  assert.equal(isExpiredGuardedDoc({ cat: 'کانفرنسز', deadline: '2026-11-01' }, TODAY), false, 'tomorrow\u2019s conference visible');
+});
+
+test('expiry guard: student feed hides expired conf/schol; admins unaffected; direct link guarded', async () => {
+  const d = await db();
+  const seed = [
+    { _id: 'n-exp-sch', id: 'n-exp-sch', cat: 'سکالرشپس', title: 'Expired Schol', deadline: 'آخری تاریخ: 28 اکتوبر 2026' },
+    { _id: 'n-exp-conf', id: 'n-exp-conf', cat: 'کانفرنسز', title: 'Expired Conf', deadline: '2026-10-15' },
+    { _id: 'n-future-sch', id: 'n-future-sch', cat: 'سکالرشپس', title: 'Future Schol', deadline: 'آخری تاریخ: 31 مارچ 2027' },
+    { _id: 'n-corridor', id: 'n-corridor', cat: 'سکالرشپس', title: 'Corridor', deadline: 'راؤنڈ 1: 30 اکتوبر 2026 — راؤنڈ 2: 30 مارچ 2027' },
+    { _id: 'n-nodate-conf', id: 'n-nodate-conf', cat: 'کانفرنسز', title: 'No Date Conf' },
+    { _id: 'n-past-course', id: 'n-past-course', cat: 'کورسز و تربیتی مواقع', title: 'Past Course', deadline: '2026-10-01' },
+  ];
+  for (const doc of seed) await d.collection('news').insertOne(doc);
+  const student = await login('approved-old@example.com', 'newpass123');
+  const list = await call('/api/content/news?limit=200', { token: student });
+  assert.equal(list.status, 200);
+  const ids = list.data.docs.map((x) => x._id);
+  assert.ok(!ids.includes('n-exp-sch'), 'expired scholarship hidden from students');
+  assert.ok(!ids.includes('n-exp-conf'), 'expired conference hidden from students');
+  assert.ok(ids.includes('n-future-sch'), 'future scholarship visible');
+  assert.ok(ids.includes('n-corridor'), 'multi-round item visible');
+  assert.ok(ids.includes('n-nodate-conf'), 'no-deadline item visible');
+  assert.ok(ids.includes('n-past-course'), 'past course (out of scope) still visible');
+  const direct = await call('/api/content/news/n-exp-sch', { token: student });
+  assert.equal(direct.status, 404, 'expired item direct link closed for students');
+  await d.collection('admins').insertOne({ _id: 'guard-admin@example.com' });
+  const adm = await call('/api/auth/admin-login', { method: 'POST', body: { email: 'guard-admin@example.com' } });
+  assert.equal(adm.status, 200);
+  const aList = await call('/api/content/news?limit=200', { token: adm.data.accessToken });
+  const aIds = aList.data.docs.map((x) => x._id);
+  assert.ok(aIds.includes('n-exp-sch') && aIds.includes('n-exp-conf'), 'admins still see expired items');
+  const aDirect = await call('/api/content/news/n-exp-sch', { token: adm.data.accessToken });
+  assert.equal(aDirect.status, 200, 'admin direct link unaffected');
+});
+
 test('abstract endpoints: a valid JWT is required (401 without token)', async () => {
   const t1 = await call('/api/help/abstract/themes', { method: 'POST', body: { language: 'en', conference: { title: 'Conf' } } });
   assert.equal(t1.status, 401);
