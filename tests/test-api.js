@@ -17,6 +17,9 @@ async function start() {
   mongod = await MongoMemoryServer.create();
   process.env.MONGO_URI = mongod.getUri();
   process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-jwt';
+  // The suite performs dozens of logins/refreshes from one loopback IP;
+  // production keeps the default 60/15min (see src/app.js authLimiter).
+  process.env.AUTH_RATE_MAX = '1000';
   const app = require('../src/app');
   server = app.listen(0);
   await new Promise((r) => server.once('listening', r));
@@ -309,17 +312,56 @@ test('admin migration overview counts migrated vs pending correctly', async () =
   assert.equal(r.data.byStatus.approved !== undefined, true);
 });
 
-test('refresh rotation revokes the old token; logout revokes', async () => {
+test('refresh rotation: previous token has a one-time 60s grace, then is dead; logout revokes', async () => {
   const first = await call('/api/auth/login', { method: 'POST', body: { email: 'approved-old@example.com', password: 'newpass123' } });
   assert.equal(first.status, 200);
   const rotated = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.data.refreshToken } });
   assert.equal(rotated.status, 200);
+  // GRACE (2026-10-31): a second tab still holding the previous token must
+  // not kill the session — the old token is accepted exactly ONCE inside
+  // its 60-second grace window and issues that tab its own fresh pair.
+  const grace = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.data.refreshToken } });
+  assert.equal(grace.status, 200, 'previous token must be accepted once inside the grace window');
+  assert.ok(grace.data.refreshToken && grace.data.refreshToken !== first.data.refreshToken);
   const stale = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.data.refreshToken } });
-  assert.equal(stale.status, 401, 'old refresh token must be revoked after rotation');
-  const out = await call('/api/auth/logout', { method: 'POST', body: { refreshToken: rotated.data.refreshToken } });
+  assert.equal(stale.status, 401, 'previous token must be dead once its grace is consumed');
+  const out = await call('/api/auth/logout', { method: 'POST', body: { refreshToken: grace.data.refreshToken } });
   assert.equal(out.status, 200);
-  const afterLogout = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: rotated.data.refreshToken } });
+  const afterLogout = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: grace.data.refreshToken } });
   assert.equal(afterLogout.status, 401, 'logged-out refresh token must be revoked');
+});
+
+test('refresh tokens are effectively permanent (~10 years)', async () => {
+  const { refreshExpiresDays } = require('../src/config');
+  assert.ok(refreshExpiresDays >= 3650, 'config TTL must be ~10 years, got ' + refreshExpiresDays);
+  const r = await call('/api/auth/login', { method: 'POST', body: { email: 'approved-old@example.com', password: 'newpass123' } });
+  assert.equal(r.status, 200);
+  const d = await db();
+  const u = await d.collection('users').findOne({ email: 'approved-old@example.com' });
+  const fresh = (u.refreshTokens || []).filter((t) => !t.rotatedAt);
+  const latest = fresh[fresh.length - 1];
+  const years = (new Date(latest.expiresAt) - Date.now()) / (365.25 * 86400000);
+  assert.ok(years > 9, 'stored refresh expiry must be ~10 years out, got ' + years.toFixed(2));
+});
+
+test('refresh grace: previous token dies once the grace window has passed', async () => {
+  const first = await call('/api/auth/login', { method: 'POST', body: { email: 'approved-old@example.com', password: 'newpass123' } });
+  assert.equal(first.status, 200);
+  const rotated = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.data.refreshToken } });
+  assert.equal(rotated.status, 200);
+  // Rewind the old entry's grace into the past, as if the 60s had elapsed.
+  const { hashToken } = require('../src/auth');
+  const d = await db();
+  const h = hashToken(first.data.refreshToken);
+  await d.collection('users').updateOne(
+    { 'refreshTokens.hash': h },
+    { $set: { 'refreshTokens.$.graceUntil': new Date(Date.now() - 1000).toISOString() } }
+  );
+  const stale = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: first.data.refreshToken } });
+  assert.equal(stale.status, 401, 'previous token must be rejected after its grace window');
+  // The current token is untouched by the old token's death.
+  const ok = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: rotated.data.refreshToken } });
+  assert.equal(ok.status, 200, 'current token must keep working');
 });
 
 test('re-register duplicate email is flagged for admin resolution', async () => {
@@ -490,10 +532,15 @@ test('admin-login: admin WITHOUT a users doc gets a passwordless session (refres
   const rot = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: r.data.refreshToken } });
   assert.equal(rot.status, 200, JSON.stringify(rot.data));
   assert.equal(rot.data.isAdmin, true);
+  // Same grace contract as users (hashes live on the admins doc): the
+  // previous token is accepted once inside its grace, then dead.
+  const grace = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: r.data.refreshToken } });
+  assert.equal(grace.status, 200, 'previous admin token must be accepted once inside the grace window');
+  assert.equal(grace.data.isAdmin, true);
   const stale = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: r.data.refreshToken } });
-  assert.equal(stale.status, 401, 'old admin refresh token must be revoked after rotation');
-  await call('/api/auth/logout', { method: 'POST', body: { refreshToken: rot.data.refreshToken } });
-  const afterLogout = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: rot.data.refreshToken } });
+  assert.equal(stale.status, 401, 'old admin refresh token must be dead once its grace is consumed');
+  await call('/api/auth/logout', { method: 'POST', body: { refreshToken: grace.data.refreshToken } });
+  const afterLogout = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: grace.data.refreshToken } });
   assert.equal(afterLogout.status, 401, 'logged-out admin refresh token must be revoked');
 });
 

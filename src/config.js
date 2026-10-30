@@ -20,7 +20,11 @@ module.exports = {
   // records and must not be callable from arbitrary websites.
   corsOrigin: process.env.CORS_ORIGIN || 'https://madrassafalkiyyat-sudo.github.io',
   jwtExpires: process.env.JWT_EXPIRES || '1h',
-  refreshExpiresDays: Number(process.env.REFRESH_EXPIRES_DAYS || 30),
+  // Refresh tokens are effectively PERMANENT (Mufti, 2026-10-31: a student
+  // who logged in once on a device must never be asked again on that
+  // device). ~10 years; revocation stays server-side via the stored
+  // SHA-256 hashes (logout / rotation), not via expiry.
+  refreshExpiresDays: Number(process.env.REFRESH_EXPIRES_DAYS || 3650),
   // Asia/Karachi is the canonical timezone for sessions/attendance.
   timezone: 'Asia/Karachi',
 };

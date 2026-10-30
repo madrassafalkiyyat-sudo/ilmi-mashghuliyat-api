@@ -220,7 +220,56 @@ router.post('/re-register', async (req, res) => {
   }
 });
 
-// POST /api/auth/refresh — rotates the refresh token (old hash revoked).
+// POST /api/auth/refresh — rotates the refresh token.
+// Rotation with a short GRACE (Mufti, 2026-10-31 — permanent student
+// sessions): the presented token is marked rotated (rotatedAt/graceUntil)
+// instead of being revoked instantly, and stays acceptable for
+// REFRESH_GRACE_MS afterwards. Two tabs share one localStorage: when tab
+// A rotates, tab B may still present the previous token a moment later —
+// without the grace that 401 killed the whole session on both tabs (the
+// boot code then wiped the fresh pair too). Within the grace the old
+// token is consumed exactly once (pulled) and a fresh pair is issued;
+// after the grace — or on second use — it is dead like any revoked token.
+// Explicit /logout still revokes immediately, grace or not.
+const REFRESH_GRACE_MS = 60 * 1000;
+
+// Validates the presented token on doc (users or admins) and performs the
+// rotation bookkeeping. Returns true when the caller may issue a fresh
+// pair for this doc. Never touches OTHER entries of the doc (other
+// devices keep their own tokens); housekeeping only drops entries that
+// are already expired or whose grace has fully passed.
+async function rotateRefresh(db, collName, doc, hash) {
+  const entry = (doc.refreshTokens || []).find((t) => t.hash === hash);
+  if (!entry) return false;
+  const now = new Date();
+  if (new Date(entry.expiresAt) < now) return false;
+  const coll = db.collection(collName);
+  if (entry.rotatedAt) {
+    if (!entry.graceUntil || new Date(entry.graceUntil) < now) return false;
+    // Previous token presented inside its grace: consume it (one-time).
+    await coll.updateOne({ _id: doc._id }, { $pull: { refreshTokens: { hash } } });
+  } else {
+    await coll.updateOne(
+      { _id: doc._id, 'refreshTokens.hash': hash },
+      { $set: {
+        'refreshTokens.$.rotatedAt': now.toISOString(),
+        'refreshTokens.$.graceUntil': new Date(now.getTime() + REFRESH_GRACE_MS).toISOString(),
+      } }
+    );
+  }
+  // Housekeeping for THIS doc only: drop long-dead entries so the array
+  // cannot grow without bound over the tokens' ~10-year lifetime.
+  const nowIso = now.toISOString();
+  await coll.updateOne(
+    { _id: doc._id },
+    { $pull: { refreshTokens: { $or: [
+      { expiresAt: { $lt: nowIso } },
+      { graceUntil: { $lt: nowIso } },
+    ] } } }
+  );
+  return true;
+}
+
 router.post('/refresh', async (req, res) => {
   const { refreshToken } = req.body || {};
   if (!refreshToken) return fail(res, 400, 'missing_fields', 'ری فریش ٹوکن درکار ہے');
@@ -229,26 +278,17 @@ router.post('/refresh', async (req, res) => {
   const user = await db.collection('users').findOne({ 'refreshTokens.hash': hash });
   if (!user) {
     // Admin without a users doc: their refresh hashes live on the admins
-    // doc (see /admin-login). Rotate exactly as for users — old hash
-    // revoked first, then a fresh pair.
+    // doc (see /admin-login). Same rotation + grace as for users.
     const adminDoc = await db.collection('admins').findOne({ 'refreshTokens.hash': hash });
     if (!adminDoc) return fail(res, 401, 'bad_token', 'ری فریش ٹوکن غلط ہے');
-    const aEntry = (adminDoc.refreshTokens || []).find((t) => t.hash === hash);
-    if (!aEntry || new Date(aEntry.expiresAt) < new Date()) {
+    if (!(await rotateRefresh(db, 'admins', adminDoc, hash))) {
       return fail(res, 401, 'bad_token', 'ری فریش ٹوکن ختم ہو گیا ہے');
     }
-    await db.collection('admins').updateOne(
-      { _id: adminDoc._id }, { $pull: { refreshTokens: { hash } } }
-    );
     return issueAdminOnlySession(db, adminDoc, res);
   }
-  const entry = (user.refreshTokens || []).find((t) => t.hash === hash);
-  if (!entry || new Date(entry.expiresAt) < new Date()) {
+  if (!(await rotateRefresh(db, 'users', user, hash))) {
     return fail(res, 401, 'bad_token', 'ری فریش ٹوکن ختم ہو گیا ہے');
   }
-  await db.collection('users').updateOne(
-    { _id: user._id }, { $pull: { refreshTokens: { hash } } }
-  );
   return issueSession(db, user, res);
 });
 

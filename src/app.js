@@ -42,7 +42,10 @@ app.get('/api/health', healthHandler);
 // generic so it reveals nothing about which accounts exist.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 60,
+  // Default unchanged (60). The env override exists for the integration
+  // test-suite, whose many logins from one loopback IP otherwise trip the
+  // limiter (tests set AUTH_RATE_MAX before requiring the app).
+  max: Number(process.env.AUTH_RATE_MAX || 60),
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => fail(res, 429, 'too_many_requests', 'بہت زیادہ کوششیں ہو گئی ہیں — کچھ دیر بعد دوبارہ کوشش کریں'),
