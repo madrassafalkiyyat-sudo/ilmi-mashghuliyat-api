@@ -459,7 +459,9 @@ async function fetchFormPage(link) {
     });
     if (!resp.ok) return null;
     const text = await resp.text();
-    return { html: text.slice(0, 1500000), headers: resp.headers }; // ~1.5MB cap
+    // resp.url is the FINAL URL after redirects — forms.gle short links
+    // resolve to their docs.google.com/forms target here (Part 7).
+    return { html: text.slice(0, 1500000), headers: resp.headers, finalUrl: resp.url || link }; // ~1.5MB cap
   } catch (e) {
     return null;
   } finally {
@@ -511,8 +513,12 @@ function inferKind(tagType, label) {
 
 /* Google Forms pages carry their questions in an embedded
    FB_PUBLIC_LOAD_DATA_ array. Walk it defensively: a question item
-   is an array whose [0] is a numeric id, [1] the title string and
-   [3] a numeric type code. Returns [] when the shape is absent. */
+   is an array whose [0] is a numeric id, [1] the title string, [3] a
+   numeric type code and [4] the answer-part list; each part's [0] is
+   the question's entry.<id> — the key Google's prefilled links use
+   (Part 7). A node only counts as a question when it carries at
+   least one numeric entry id (section headers etc. carry none and
+   are skipped). Returns [] when the shape is absent. */
 function extractGoogleFormFields(html) {
   const marker = html.indexOf('FB_PUBLIC_LOAD_DATA_');
   if (marker < 0) return [];
@@ -535,19 +541,113 @@ function extractGoogleFormFields(html) {
   if (end < 0) return [];
   let data;
   try { data = JSON.parse(html.slice(start, end + 1)); } catch (e) { return []; }
-  const typeKind = { 0: 'text', 1: 'paragraph', 2: 'choice', 3: 'choice', 4: 'choice', 9: 'date' };
+  const typeKind = { 0: 'text', 1: 'paragraph', 2: 'choice', 3: 'choice', 4: 'checkbox', 5: 'choice', 6: 'grid', 7: 'file', 9: 'date', 10: 'time' };
+  // Types a prefilled link can actually carry. File uploads (7) and
+  // grids (6) can never be prefilled — they stay manual by design.
+  const prefillTypes = new Set([0, 1, 2, 3, 4, 5, 9, 10]);
   const out = [];
   const seen = new Set();
   (function walk(node) {
     if (!Array.isArray(node)) return;
-    if (typeof node[0] === 'number' && typeof node[1] === 'string' && typeof node[3] === 'number' && node[1].trim()) {
-      const label = node[1].trim();
-      if (!seen.has(label)) { seen.add(label); out.push({ label, kind: typeKind[node[3]] || 'text' }); }
+    if (typeof node[0] === 'number' && typeof node[1] === 'string' && typeof node[3] === 'number' && Array.isArray(node[4]) && node[1].trim()) {
+      const gType = node[3];
+      const parts = node[4].filter((p) => Array.isArray(p) && typeof p[0] === 'number');
+      if (!parts.length) return; // not an answerable question (header…)
+      parts.forEach((part, pi) => {
+        const entryId = part[0];
+        if (seen.has(entryId)) return;
+        seen.add(entryId);
+        const rawOpts = Array.isArray(part[1]) ? part[1] : [];
+        const options = rawOpts.map((o) => (Array.isArray(o) ? String(o[0] || '').trim() : '')).filter(Boolean);
+        out.push({
+          label: node[1].trim(),
+          kind: typeKind[gType] || 'text',
+          entryId,
+          gType,
+          options,
+          // A multi-part question (grid rows) shares one title across
+          // several entry ids; only single-part questions prefill.
+          prefillCapable: parts.length === 1 && prefillTypes.has(gType),
+        });
+        void pi;
+      });
       return; // do not descend into a question's own sub-arrays
     }
     for (const child of node) walk(child);
   })(data);
   return out;
+}
+
+/* The canonical public base of a Google Form (…/viewform, no query):
+   prefilled links are built on it. An /edit authoring URL is turned
+   into its public /viewform twin; anything else keeps origin+path. */
+function googleFormBaseUrl(raw) {
+  let u;
+  try { u = new URL(String(raw || '')); } catch (e) { return null; }
+  let path = u.pathname.replace(/\/edit\/?$/, '/viewform');
+  return u.origin + path;
+}
+
+/* One field → its prefilled-link parameters. Mirrors the frontend
+   builder (ffPrefillParams) — keep the two in step. Returns [] when
+   the value cannot travel: no entry id, not prefill-capable, empty
+   answer, a dropdown/scale value outside the offered options, or a
+   date/time that is not in a clean, parseable shape. */
+function googlePrefillParams(f) {
+  if (!f || f.entryId == null || !f.prefillCapable) return [];
+  const v = f.answer == null ? '' : String(f.answer).trim();
+  if (!v) return [];
+  const key = 'entry.' + f.entryId;
+  if (f.kind === 'date') {
+    let y, mo, d;
+    let m = v.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+    if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+    else {
+      m = v.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+      if (m) { d = +m[1]; mo = +m[2]; y = +m[3]; }
+    }
+    if (!y || mo < 1 || mo > 12 || d < 1 || d > 31) return [];
+    return [[key + '_year', String(y)], [key + '_month', String(mo)], [key + '_day', String(d)]];
+  }
+  if (f.kind === 'time') {
+    const m = v.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return [];
+    return [[key + '_hour', String(+m[1])], [key + '_minute', String(+m[2])]];
+  }
+  if (f.kind === 'checkbox') {
+    const opts = Array.isArray(f.options) ? f.options : [];
+    const vals = v.split(/\s*[,،\n]\s*/).map((x) => x.trim()).filter(Boolean);
+    const pairs = [];
+    const other = [];
+    for (const val of vals) {
+      if (!opts.length || opts.includes(val)) pairs.push([key, val]);
+      else other.push(val);
+    }
+    if (other.length) {
+      pairs.push([key, '__other_option__']);
+      pairs.push([key + '.other_option_response', other.join(', ')]);
+    }
+    return pairs;
+  }
+  if (f.kind === 'choice') {
+    const opts = Array.isArray(f.options) ? f.options : [];
+    if (opts.length && !opts.includes(v)) {
+      // Radio questions accept Google's "Other" response; dropdowns
+      // and scales do not — those stay for the student to pick.
+      if (f.gType === 2) return [[key, '__other_option__'], [key + '.other_option_response', v]];
+      return [];
+    }
+    return [[key, v]];
+  }
+  return [[key, v]];
+}
+
+function buildGooglePrefillUrl(base, fields) {
+  if (!base) return null;
+  const pairs = [['usp', 'pp_url']];
+  for (const f of fields || []) pairs.push(...googlePrefillParams(f));
+  if (pairs.length === 1) return null; // nothing can travel — no fake prefill
+  return base + '?' + pairs.map(([k, val]) => encodeURIComponent(k) + '=' + encodeURIComponent(val)).join('&');
 }
 
 /* Generic HTML forms: labels + controls in document order. */
@@ -563,6 +663,18 @@ function extractGenericFormFields(html) {
     const txt = htmlText(m[2]);
     if (forM && txt) labelsByFor[forM[1]] = txt;
   }
+  // Document spans covered by a <form>…</form> (for the real-form
+  // preference rule below).
+  const formSpans = [];
+  {
+    const formRe = /<form\b[^>]*>|<\/form\s*>/gi;
+    let fm, openAt = -1;
+    while ((fm = formRe.exec(cleaned))) {
+      if (fm[0].charAt(1) === '/') { if (openAt >= 0) { formSpans.push([openAt, fm.index]); openAt = -1; } }
+      else if (openAt < 0) openAt = fm.index;
+    }
+    if (openAt >= 0) formSpans.push([openAt, cleaned.length]);
+  }
   const fields = [];
   const ctrlRe = /<(input|textarea|select)\b([^>]*)>/gi;
   while ((m = ctrlRe.exec(cleaned))) {
@@ -574,6 +686,18 @@ function extractGenericFormFields(html) {
     };
     const type = attr('type').toLowerCase() || (tag === 'input' ? 'text' : tag);
     if (['hidden', 'submit', 'button', 'reset', 'image'].includes(type)) continue;
+    /* Extraction hygiene (Mufti, 2026-10-31): page CHROME is not form
+       content. A site «Search» box was once extracted and the ask loop
+       demanded «خانہ «Search» کے لیے معلومات لکھیں». Rules:
+         – type=search inputs are chrome, always.
+         – a field whose label/name/placeholder mentions search/تلاش or
+           a newsletter/subscribe box is chrome.
+         – real-form preference (applied after collection): when some
+           <form> holds ≥3 fillable fields, fields OUTSIDE any <form>
+           are dropped; formless pages keep everything. Login pages
+           (tiny sets) are unaffected — they are handled by loginFirst,
+           never by the fill loop. */
+    if (type === 'search') continue;
     const id = attr('id');
     let label = (id && labelsByFor[id]) || attr('placeholder') || attr('aria-label') || attr('name') || '';
     if (!label) {
@@ -584,11 +708,22 @@ function extractGenericFormFields(html) {
     }
     label = htmlText(label).slice(0, 200);
     if (!label) continue;
-    fields.push({ label, kind: inferKind(type, label) });
+    const chromeProbe = `${label} ${attr('name')} ${attr('placeholder')} ${attr('aria-label')}`;
+    if (/search|تلاش|newsletter|subscribe/i.test(chromeProbe)) continue;
+    const inForm = formSpans.some(([a, b]) => m.index > a && m.index < b);
+    fields.push({ label, kind: inferKind(type, label), _f: inForm ? 1 : 0, _pos: m.index });
     if (fields.length >= MAX_FORM_FIELDS) break;
   }
   // Dedup consecutive identical labels (radio groups share one question).
-  return fields.filter((f, i) => i === 0 || f.label !== fields[i - 1].label);
+  const deduped = fields.filter((f, i) => i === 0 || f.label !== fields[i - 1].label);
+  // Real-form preference: the largest single <form>'s field count.
+  let maxInOneForm = 0;
+  for (const [a, b] of formSpans) {
+    const c = deduped.filter((f) => f._pos > a && f._pos < b).length;
+    if (c > maxInOneForm) maxInOneForm = c;
+  }
+  const kept = maxInOneForm >= 3 ? deduped.filter((f) => f._f === 1) : deduped;
+  return kept.map(({ label, kind }) => ({ label, kind }));
 }
 
 /* Login-page recognition (Mufti, 2026-10-31): the AIOU link students
@@ -612,8 +747,9 @@ function extractFormFields(html) {
   const h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
   const title = htmlText(titleM ? titleM[1] : (h1M ? h1M[1] : '')).slice(0, 200);
   let fields = extractGoogleFormFields(html);
+  const provider = fields.length ? 'google' : 'generic';
   if (!fields.length) fields = extractGenericFormFields(html);
-  return { title, fields: fields.slice(0, MAX_FORM_FIELDS) };
+  return { title, fields: fields.slice(0, MAX_FORM_FIELDS), provider };
 }
 
 /* The student's own basics — top-level record fields first, then the
@@ -676,16 +812,18 @@ const FORM_RULES = [
 
 function mapFieldsRule(fields, profile) {
   return (fields || []).map((f) => {
-    if (f.kind === 'file') return { label: f.label, kind: f.kind, answer: null, source: null };
-    if (isPasswordField(f)) return { label: f.label, kind: 'password', answer: null, source: null }; // credentials are NEVER mapped or filled
+    // Spread keeps extraction metadata (Google entryId/gType/options/
+    // prefillCapable) attached to the mapped field — Part 7 needs it.
+    if (f.kind === 'file') return { ...f, answer: null, source: null };
+    if (isPasswordField(f)) return { ...f, kind: 'password', answer: null, source: null }; // credentials are NEVER mapped or filled
     const label = String(f.label || '');
     for (const [re, key] of FORM_RULES) {
       if (re.test(label)) {
         const v = profile[key];
-        return { label: f.label, kind: f.kind, answer: v ? v : null, source: v ? 'profile' : null };
+        return { ...f, answer: v ? v : null, source: v ? 'profile' : null };
       }
     }
-    return { label: f.label, kind: f.kind, answer: null, source: null };
+    return { ...f, answer: null, source: null };
   });
 }
 
@@ -742,6 +880,9 @@ router.post('/formfill', requireAuth, formfillLimiter, async (req, res) => {
   let formTitle = '';
   let fields = null;
   let embeddable = null; // link path only: can the page be framed in-app?
+  let provider = null; // 'google' | 'generic' (link path)
+  let formBaseUrl = null; // Google only: canonical /viewform base
+  let prefillAvailable = false;
   if (link) {
     if (!formUrlAllowed(link)) {
       return fail(res, 400, 'bad_link', 'یہ لنک درست نہیں — مکمل آفیشل لنک (https…) لکھیں، یا فارم کا اسکرین شاٹ بھیجیں');
@@ -754,6 +895,12 @@ router.post('/formfill', requireAuth, formfillLimiter, async (req, res) => {
     const ex = extractFormFields(page.html);
     formTitle = ex.title;
     fields = ex.fields;
+    provider = ex.provider;
+    if (provider === 'google') {
+      // page.finalUrl already followed any forms.gle redirect.
+      formBaseUrl = googleFormBaseUrl(page.finalUrl || link);
+      prefillAvailable = !!(formBaseUrl && fields.some((f) => f.entryId != null && f.prefillCapable));
+    }
     if (!fields.length) {
       return fail(res, 422, 'form_fields_not_found', 'اس صفحے پر فارم کے خانے نہیں مل سکے — فارم کا اسکرین شاٹ اپ لوڈ کر کے کوشش کریں');
     }
@@ -787,15 +934,16 @@ router.post('/formfill', requireAuth, formfillLimiter, async (req, res) => {
      leads with the login step; the portal's own credential fields are
      never returned as fillable fields. */
   if (detectLoginPage(fields)) {
-    return res.json({ ok: true, formTitle, fields: [], embeddable, loginFirst: true });
+    return res.json({ ok: true, formTitle, fields: [], embeddable, loginFirst: true, provider, formBaseUrl, prefillAvailable: false, prefillUrl: null });
   }
 
   const profile = formProfile(req.user);
   let mapped = mapFieldsRule(fields, profile);
   mapped = await refineWithAi(mapped, profile, note, process.env.GEMINI_API_KEY);
-  return res.json({ ok: true, formTitle, fields: mapped, embeddable, loginFirst: false });
+  const prefillUrl = prefillAvailable ? buildGooglePrefillUrl(formBaseUrl, mapped) : null;
+  return res.json({ ok: true, formTitle, fields: mapped, embeddable, loginFirst: false, provider, formBaseUrl, prefillAvailable, prefillUrl });
 });
 
-router._test = { extractFormFields, extractGoogleFormFields, extractGenericFormFields, mapFieldsRule, formProfile, formUrlAllowed, frameEmbeddable, detectLoginPage, isPasswordField };
+router._test = { extractFormFields, extractGoogleFormFields, extractGenericFormFields, mapFieldsRule, formProfile, formUrlAllowed, frameEmbeddable, detectLoginPage, isPasswordField, googleFormBaseUrl, googlePrefillParams, buildGooglePrefillUrl };
 
 module.exports = router;

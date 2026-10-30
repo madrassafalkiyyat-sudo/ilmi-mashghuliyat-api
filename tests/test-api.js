@@ -852,6 +852,9 @@ test('formfill: generic HTML form — fields in order, answers only from the pro
     assert.equal(byLabel['Statement of Purpose'].answer, null);
     assert.equal(byLabel['Statement of Purpose'].kind, 'paragraph');
     assert.equal(byLabel['Email Address'].kind, 'email');
+    assert.equal(r.data.provider, 'generic', 'non-Google link stays in guidance mode');
+    assert.equal(r.data.prefillAvailable, false);
+    assert.equal(r.data.prefillUrl, null);
   } finally {
     await new Promise((r) => srv.close(r));
   }
@@ -870,9 +873,66 @@ test('formfill: Google-Forms-like page — question titles extracted from the em
     const r = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${srv.address().port}/gform` } });
     assert.equal(r.status, 200, JSON.stringify(r.data));
     assert.deepEqual(r.data.fields.map((f) => f.label), ['Email Address', 'Full Name', 'Why do you want this scholarship?']);
+    assert.deepEqual(r.data.fields.map((f) => f.entryId), [222, 444, 666], 'entry ids captured, aligned with the ordered questions');
     assert.equal(r.data.fields[2].kind, 'paragraph');
     assert.equal(r.data.fields[0].answer, 'ff-student@example.com');
     assert.equal(r.data.fields[2].answer, null);
+    assert.equal(r.data.provider, 'google');
+    assert.equal(r.data.prefillAvailable, true);
+    assert.ok(r.data.formBaseUrl.endsWith('/gform'), 'base is the final (post-redirect) form URL without query');
+    assert.ok(r.data.prefillUrl.includes('usp=pp_url'));
+    assert.ok(r.data.prefillUrl.includes('entry.222=ff-student%40example.com'));
+    assert.ok(r.data.prefillUrl.includes('entry.444=FF%20Student'));
+    assert.ok(!r.data.prefillUrl.includes('entry.666='), 'unanswered question is absent from the prefill URL');
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+test('formfill: Google prefill engine — types, file exclusion, date parts, redirect resolution', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const http = require('node:http');
+  const help = require('../src/routes/help');
+  const T = help._test;
+  // Builder-level proofs (exact params).
+  const built = T.buildGooglePrefillUrl('https://docs.google.com/forms/d/e/TEST/viewform', [
+    { label: 'Email Address', kind: 'text', entryId: 101, gType: 0, options: [], prefillCapable: true, answer: 'ff-student@example.com' },
+    { label: 'Interests', kind: 'checkbox', entryId: 103, gType: 4, options: ['Research', 'Teaching'], prefillCapable: true, answer: 'Research, Teaching' },
+    { label: 'Date of Birth', kind: 'date', entryId: 105, gType: 9, options: [], prefillCapable: true, answer: '2001-03-04' },
+    { label: 'Upload CV', kind: 'file', entryId: 104, gType: 7, options: [], prefillCapable: false, answer: null },
+    { label: 'Why?', kind: 'paragraph', entryId: 106, gType: 1, options: [], prefillCapable: true, answer: null },
+  ]);
+  assert.ok(built.includes('entry.101=ff-student%40example.com'));
+  assert.equal((built.match(/entry\.103=/g) || []).length, 2, 'checkbox repeats the entry param once per value');
+  assert.ok(built.includes('entry.103=Research') && built.includes('entry.103=Teaching'));
+  assert.ok(built.includes('entry.105_year=2001') && built.includes('entry.105_month=3') && built.includes('entry.105_day=4'), 'date splits into Google year/month/day params');
+  assert.ok(!built.includes('entry.104'), 'file-upload question never travels');
+  assert.ok(!built.includes('entry.106'), 'missing answer stays absent until the ask loop supplies it');
+  const rebuilt = T.buildGooglePrefillUrl('https://docs.google.com/forms/d/e/TEST/viewform', [
+    { label: 'Why?', kind: 'paragraph', entryId: 106, gType: 1, options: [], prefillCapable: true, answer: 'For research' },
+  ]);
+  assert.ok(rebuilt.includes('entry.106=For%20research'), 'after the ask-loop answer is saved, a rebuild carries it');
+  assert.equal(T.googleFormBaseUrl('https://docs.google.com/forms/d/e/ABC/edit#responses'), 'https://docs.google.com/forms/d/e/ABC/viewform', '/edit normalizes to the public /viewform');
+
+  // Redirect (forms.gle-style) resolves to the Google page and is detected.
+  const gform = `<html><head><title>Session Registration</title></head><body>
+    <script>var FB_PUBLIC_LOAD_DATA_ = [null,[[[201,"Email Address",null,0,[[301,null,0]]],[202,"Full Name",null,0,[[302,null,0]]],[203,"Upload Photo",null,7,[[303,null,0]]]]],null];</script>
+    </body></html>`;
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/short') { res.writeHead(302, { Location: '/gform' }); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(gform);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const tok = await login('ff-student@example.com', 'ffpass1234');
+    const r = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${srv.address().port}/short` } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.provider, 'google', 'redirect target detected as a Google Form');
+    assert.ok(r.data.formBaseUrl.endsWith('/gform'), 'base uses the resolved final URL');
+    const file = r.data.fields.find((f) => f.label === 'Upload Photo');
+    assert.equal(file.kind, 'file');
+    assert.equal(file.prefillCapable, false, 'file question marked non-carrying');
+    assert.ok(!r.data.prefillUrl.includes('entry.303'), 'file entry id absent from the URL');
   } finally {
     await new Promise((r) => srv.close(r));
   }
@@ -931,6 +991,41 @@ test('formfill: a portal LOGIN page is flagged loginFirst and its credential fie
     assert.equal(r.data.loginFirst, true, 'tiny user+password set -> loginFirst');
     assert.equal(r.data.fields.length, 0, 'no fillable fields are returned for a login page');
     assert.ok(!JSON.stringify(r.data.fields).match(/password/i), 'password field never present');
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+test('formfill extraction hygiene: search/newsletter chrome dropped, real form kept whole', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const http = require('node:http');
+  const page = `<html><head><title>University Admission Form</title></head><body>
+    <header><input type="search" placeholder="Search"><input type="text" name="q" placeholder="Search the site"></header>
+    <form method="post" action="/apply">
+      <label for="fn">Full Name</label><input id="fn" type="text" name="fullname">
+      <label for="fa">Father Name</label><input id="fa" type="text" name="fathername">
+      <label for="cn">CNIC Number</label><input id="cn" type="text" name="cnic">
+      <label for="em">Email Address</label><input id="em" type="email" name="email">
+      <label for="mo">Mobile Number</label><input id="mo" type="tel" name="mobile">
+      <input type="submit" value="Apply">
+    </form>
+    <footer><label for="nl">Subscribe to our newsletter</label><input id="nl" type="email" name="newsletter_email"></footer>
+    </body></html>`;
+  const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(page); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const tok = await login('ff-student@example.com', 'ffpass1234');
+    const r = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${srv.address().port}/admission` } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.deepEqual(r.data.fields.map((f) => f.label), ['Full Name', 'Father Name', 'CNIC Number', 'Email Address', 'Mobile Number'],
+      'exactly the 5 real application fields, in order — ordinals 1..5');
+    assert.ok(!JSON.stringify(r.data.fields).match(/search|newsletter|subscribe/i), 'no chrome field survives');
+    assert.equal(r.data.loginFirst, false);
+    // The hygiene path must not break profile mapping.
+    const byLabel = Object.fromEntries(r.data.fields.map((f) => [f.label, f.answer]));
+    assert.equal(byLabel['Full Name'], 'FF Student');
+    assert.equal(byLabel['Email Address'], 'ff-student@example.com');
+    assert.equal(byLabel['CNIC Number'], null, 'profile has no CNIC -> null, never fabricated');
   } finally {
     await new Promise((r) => srv.close(r));
   }
