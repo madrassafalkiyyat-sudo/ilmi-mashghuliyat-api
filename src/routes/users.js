@@ -5,7 +5,8 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireApproved, fail } = require('../middleware/auth');
-const { profileMissing, scoreVision, visionHash } = require('../lib/rules');
+const { profileMissing } = require('../lib/rules');
+const { applyVisionReview } = require('../lib/vision');
 const { hashPassword } = require('../auth');
 
 const router = express.Router();
@@ -49,9 +50,15 @@ router.patch('/me/profile', async (req, res) => {
 });
 
 // POST /api/users/me/vision — vision text submission + auto-review.
-// Human 'incomplete' is never overridden: if visionReview.decision is
-// 'incomplete' with source 'admin', scoring is skipped and the record is
-// left for the student's corrected resubmission (which an admin clears).
+// The verdict itself lives in lib/vision.applyVisionReview (the single
+// enforcement point, shared with registration + the boot heal): one
+// decision per text hash, an admin's incomplete decision record is
+// never silently overwritten, approve/incomplete send the old flow's
+// deterministic exactly-once notifications. (This replaces the former
+// 409 'awaiting_admin_clear' behaviour, which dead-ended every student
+// an admin had marked incomplete: nobody ever sent adminCleared. The
+// old automation's semantics apply instead — a corrected resubmission
+// IS the answer to an incomplete, and it is reviewed on arrival.)
 router.post('/me/vision', async (req, res) => {
   const { text } = req.body || {};
   if (!text || String(text).trim().length < 20) {
@@ -59,26 +66,9 @@ router.post('/me/vision', async (req, res) => {
   }
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
-  const prev = user.visionReview || {};
-  if (prev.decision === 'incomplete' && prev.source === 'admin' && !req.body.adminCleared) {
-    return fail(res, 409, 'awaiting_admin_clear', 'پچھلا فیصلہ انتظامیہ کے پاس ہے');
-  }
-  const result = scoreVision(text);
-  const review = {
-    at: new Date().toISOString(), by: 'auto', source: 'auto',
-    hash: visionHash(text), score: result.score, matched: result.matched,
-    decision: result.decision,
-  };
-  const update = {
-    $set: { visionSummary: String(text).slice(0, 4000), visionDate: review.at, visionReview: review },
-  };
-  // Auto-approve ONLY moves a pending account to approved; it never
-  // approves a rejected account and never touches admin decisions.
-  if (result.decision === 'approve' && user.status === 'pending') {
-    update.$set.status = 'approved';
-  }
-  await db.collection('users').updateOne({ _id: user._id }, update);
-  return res.json({ review, status: update.$set.status || user.status });
+  if (!user) return fail(res, 404, 'not_found', 'صارف موجود نہیں');
+  const r = await applyVisionReview(db, user, String(text));
+  return res.json({ review: r.review, status: r.status });
 });
 
 // POST /api/users/me/password — set/change own password (logged-in only).

@@ -539,3 +539,121 @@ test('admin-login: non-admin emails rejected generically; student password login
   const bad = await call('/api/auth/login', { method: 'POST', body: { email: 'plain-student@example.com', password: '' } });
   assert.equal(bad.status, 400, 'an empty password must never log a student in');
 });
+
+const VISION_APPROVE_TEXT = 'میں یونیورسٹی میں تحقیق کرنا چاہتا ہوں اور مدرسہ ڈاٹ پی کے کے ساتھ مل کر ادارہ سازی کے لیے مفت تربیت دینا چاہتا ہوں';
+const VISION_BORDERLINE_TEXT = 'میں یونیورسٹی میں تحقیق کرنا چاہتا ہوں اور مدرسہ میں پڑھاتا ہوں';
+
+test('register: name + form fields + vision persist; matching vision auto-approves + welcome notification (Mufti 2026-10-30)', async () => {
+  const r = await call('/api/auth/register', {
+    method: 'POST',
+    body: {
+      email: 'new-student@example.com', password: 'studentpass123',
+      name: 'نیا طالب علم', mobile: '03001234567', degree: 'پی ایچ ڈی', dept: 'اسلامک سٹڈیز',
+      madrasa: 'جامعہ مثال', uni: 'مثال یونیورسٹی', country: 'پاکستان', admissionRoute: 'madrasa',
+      visionSummary: VISION_APPROVE_TEXT,
+    },
+  });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.user.name, 'نیا طالب علم');
+  assert.equal(r.data.user.status, 'approved', 'clearly matching vision auto-approves at submission time');
+  const d = await db();
+  const doc = await d.collection('users').findOne({ email: 'new-student@example.com' });
+  assert.equal(doc.name, 'نیا طالب علم', 'admin card name line reads top-level name');
+  assert.equal(doc.degree, 'پی ایچ ڈی');
+  assert.equal(doc.uni, 'مثال یونیورسٹی');
+  assert.equal(doc.visionSummary, VISION_APPROVE_TEXT, 'admin card vision line reads visionSummary');
+  assert.equal(doc.visionReview.decision, 'approve');
+  assert.equal(doc.visionReview.source, 'auto');
+  const notif = await d.collection('notifications').findOne({ id: `welcome-approved-${doc.uid}` });
+  assert.ok(notif, 'welcome notification with the old flow deterministic id');
+  assert.equal(notif.kind, 'welcome-approved');
+});
+
+test('register: junk vision marks incomplete with deterministic notification; account stays pending', async () => {
+  const r = await call('/api/auth/register', {
+    method: 'POST',
+    body: { email: 'junk-vision@example.com', password: 'studentpass123', name: 'فضول خلاصہ', visionSummary: 'ہاہاہا ہاہاہا یہ سب مذاق ہے مذاق' },
+  });
+  assert.equal(r.status, 201);
+  assert.equal(r.data.user.status, 'pending');
+  const d = await db();
+  const doc = await d.collection('users').findOne({ email: 'junk-vision@example.com' });
+  assert.equal(doc.status, 'pending');
+  assert.equal(doc.visionReview.decision, 'incomplete');
+  assert.equal(doc.incomplete.reason, 'vision');
+  assert.equal(doc.incomplete.state, 'awaiting');
+  const { visionHash } = require('../src/lib/rules');
+  const notif = await d.collection('notifications').findOne({ id: `incomplete-auto-${doc.uid}-${visionHash(doc.visionSummary)}` });
+  assert.ok(notif, 'incomplete notification id matches the old flow format incomplete-auto-<uid>-<hash>');
+  assert.equal(notif.kind, 'incomplete');
+});
+
+test('register: without vision fields the old sparse behaviour is unchanged', async () => {
+  const r = await call('/api/auth/register', { method: 'POST', body: { email: 'plain-reg@example.com', password: 'studentpass123' } });
+  assert.equal(r.status, 201);
+  assert.equal(r.data.user.status, 'pending');
+  const d = await db();
+  const doc = await d.collection('users').findOne({ email: 'plain-reg@example.com' });
+  assert.equal(doc.visionReview, undefined);
+  assert.equal(doc.visionSummary, undefined);
+});
+
+test('vision API: one decision per text — resubmission of the same text is a no-op, notification stays single', async () => {
+  await call('/api/auth/register', { method: 'POST', body: { email: 'vision-dedupe@example.com', password: 'studentpass123', name: 'دوبارہ جمع' } });
+  const token = await login('vision-dedupe@example.com', 'studentpass123');
+  const first = await call('/api/users/me/vision', { method: 'POST', token, body: { text: VISION_APPROVE_TEXT } });
+  assert.equal(first.status, 200);
+  assert.equal(first.data.review.decision, 'approve');
+  assert.equal(first.data.status, 'approved');
+  const second = await call('/api/users/me/vision', { method: 'POST', token, body: { text: VISION_APPROVE_TEXT } });
+  assert.equal(second.status, 200);
+  assert.equal(second.data.review.decision, 'approve');
+  assert.equal(second.data.review.hash, first.data.review.hash);
+  const d = await db();
+  const doc = await d.collection('users').findOne({ email: 'vision-dedupe@example.com' });
+  const count = await d.collection('notifications').countDocuments({ id: `welcome-approved-${doc.uid}` });
+  assert.equal(count, 1, 'exactly-once: repeated submission must not duplicate the welcome notification');
+});
+
+test('vision API: borderline text records the review only — no status change, no notification', async () => {
+  await call('/api/auth/register', { method: 'POST', body: { email: 'vision-border@example.com', password: 'studentpass123', name: 'سرحدی' } });
+  const token = await login('vision-border@example.com', 'studentpass123');
+  const r = await call('/api/users/me/vision', { method: 'POST', token, body: { text: VISION_BORDERLINE_TEXT } });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.review.decision, 'borderline');
+  assert.equal(r.data.status, 'pending', 'borderline stays with the human — no auto status change');
+  const d = await db();
+  const doc = await d.collection('users').findOne({ email: 'vision-border@example.com' });
+  assert.equal(doc.visionSummary, VISION_BORDERLINE_TEXT);
+  assert.equal(doc.incomplete, undefined);
+  const n = await d.collection('notifications').countDocuments({ email: 'vision-border@example.com' });
+  assert.equal(n, 0);
+});
+
+test('vision heal: verdict + name backfilled only where missing; idempotent; awaiting/approved/sample untouched', async () => {
+  const d = await db();
+  const { healVisionRecords } = require('../src/lib/vision');
+  const { visionHash } = require('../src/lib/rules');
+  await seedUser({ _id: 'heal-1', uid: 'heal-1', email: 'heal1@example.com', name: '', status: 'pending', role: 'student', profile: { name: 'شفاء احمد' }, visionSummary: VISION_APPROVE_TEXT });
+  await seedUser({ _id: 'heal-2', uid: 'heal-2', email: 'heal2@example.com', name: 'پہلے سے فیصلہ شدہ', status: 'pending', role: 'student', profile: {}, visionSummary: VISION_APPROVE_TEXT, visionReview: { decision: 'borderline', hash: visionHash(VISION_APPROVE_TEXT), source: 'auto' } });
+  await seedUser({ _id: 'heal-3', uid: 'heal-3', email: 'heal3@example.com', name: 'منظور شدہ', status: 'approved', role: 'student', profile: {}, visionSummary: VISION_APPROVE_TEXT });
+  await seedUser({ _id: 'heal-4', uid: 'heal-4', email: 'heal4@example.com', name: 'زیر التوا انسانی فیصلہ', status: 'pending', role: 'student', profile: {}, visionSummary: 'ہاہاہا مذاق', incomplete: { reason: 'vision', state: 'awaiting' } });
+  const c1 = await healVisionRecords(d);
+  assert.equal(c1.namesFilled, 1);
+  assert.equal(c1.reviewed, 1);
+  assert.equal(c1.approved, 1);
+  const h1 = await d.collection('users').findOne({ _id: 'heal-1' });
+  assert.equal(h1.name, 'شفاء احمد', 'name lifted from profile.name');
+  assert.equal(h1.status, 'approved');
+  assert.equal(h1.visionReview.decision, 'approve');
+  const h2 = await d.collection('users').findOne({ _id: 'heal-2' });
+  assert.equal(h2.status, 'pending', 'existing verdict record untouched');
+  assert.equal(h2.visionReview.decision, 'borderline');
+  const h3 = await d.collection('users').findOne({ _id: 'heal-3' });
+  assert.equal(h3.visionReview, undefined, 'approved students are not re-reviewed by the heal');
+  const h4 = await d.collection('users').findOne({ _id: 'heal-4' });
+  assert.equal(h4.visionReview, undefined, 'human awaiting decision is never touched');
+  const c2 = await healVisionRecords(d);
+  assert.equal(c2.namesFilled, 0, 'second run fills nothing');
+  assert.equal(c2.reviewed, 0, 'second run reviews nothing — idempotent');
+});

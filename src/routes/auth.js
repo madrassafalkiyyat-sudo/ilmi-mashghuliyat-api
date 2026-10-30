@@ -10,6 +10,7 @@ const rateLimit = require('express-rate-limit');
 const { getDb } = require('../db');
 const { hashPassword, checkPassword, signAccessToken, hashToken, newRefreshToken } = require('../auth');
 const { fail } = require('../middleware/auth');
+const { applyVisionReview } = require('../lib/vision');
 const config = require('../config');
 
 const router = express.Router();
@@ -54,8 +55,19 @@ async function issueAdminOnlySession(db, adminDoc, res) {
 // The old app hid the login surface before approval; the API mirrors it:
 // a pending account receives a token but requireApproved blocks gated
 // content until an admin approves.
+//
+// The registration form's fields (name, mobile, degree, dept, madrasa,
+// uni, country, admissionRoute) are stored at top level — the same
+// shape the admin panel reads. Until 2026-10-30 the client never sent
+// them and this route never stored them, so new students appeared in
+// the admin list with NO name and NO vision summary (Mufti's report).
+// A visionSummary sent with the registration is reviewed HERE, at
+// submission time (lib/vision.applyVisionReview): a clearly matching
+// summary auto-approves the account, junk marks it incomplete — the
+// rules the Firestore-bound automation used to apply within 30 min.
 router.post('/register', async (req, res) => {
-  const { email, password, name } = req.body || {};
+  const body = req.body || {};
+  const { email, password } = body;
   if (!email || !EMAIL_RE.test(email)) return fail(res, 400, 'bad_email', 'درست ای میل لکھیں');
   if (!password || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
   try {
@@ -64,14 +76,25 @@ router.post('/register', async (req, res) => {
     const existing = await db.collection('users').findOne({ email: norm });
     if (existing) return fail(res, 409, 'email_taken', 'یہ ای میل پہلے سے درج ہے');
     const now = new Date().toISOString();
+    const str = (v, cap) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, cap) : undefined);
     const doc = {
       _id: `u_${Date.now().toString(36)}`,
       uid: `u_${Date.now().toString(36)}`,
-      email: norm, name: name || '', status: 'pending', role: 'student',
+      email: norm, name: str(body.name, 120) || '', status: 'pending', role: 'student',
       passwordHash: await hashPassword(password),
       regAt: now, profile: {}, refreshTokens: [],
     };
+    for (const k of ['mobile', 'degree', 'dept', 'madrasa', 'uni', 'country', 'admissionRoute']) {
+      const v = str(body[k], 200);
+      if (v !== undefined) doc[k] = v;
+    }
     await db.collection('users').insertOne(doc);
+    const visionText = typeof body.visionSummary === 'string' ? body.visionSummary.trim() : '';
+    if (visionText.length >= 20) {
+      await applyVisionReview(db, doc, visionText);
+      const fresh = await db.collection('users').findOne({ _id: doc._id });
+      return res.status(201).json({ user: publicUser(fresh || doc), message: 'درخواست موصول — انتظامیہ کی منظوری کے بعد رسائی کھلے گی' });
+    }
     return res.status(201).json({ user: publicUser(doc), message: 'درخواست موصول — انتظامیہ کی منظوری کے بعد رسائی کھلے گی' });
   } catch (e) {
     if (e.code === 11000) return fail(res, 409, 'email_taken', 'یہ ای میل پہلے سے درج ہے');

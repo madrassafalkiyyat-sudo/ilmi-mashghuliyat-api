@@ -29,6 +29,15 @@ async function main() {
   tick();
   const timer = setInterval(tick, 60 * 60 * 1000);
   if (timer.unref) timer.unref();
+  // Vision self-heal (one-shot at boot, idempotent): students whose
+  // vision summary reached the server without a verdict (the verdict
+  // used to be Firestore-automation-only) get it applied now, and a
+  // name that only exists under profile.* is lifted to top level.
+  // Records that already have a verdict or a name are never touched.
+  const vision = require('./lib/vision');
+  vision.healVisionRecords(db).catch((e) => {
+    console.error('vision heal failed:', e && e.message);
+  });
 }
 
 main().catch((err) => {

@@ -20,8 +20,8 @@ function normalizeText(s) {
 // ---------- vision auto-review ----------
 // 8 concept groups, ported verbatim from automation/vision_review.py.
 // Approve: >= 3 groups matched AND at least one core (topical) group.
-// Incomplete (junk): <= 1 group matched AND no institution group.
-// Anything else: borderline — stays with the human (admin), never auto-set.
+// Incomplete: junk (markers / repetition), or <= 1 group matched AND no
+// institution group. Anything else: borderline — stays with the human.
 const CONCEPTS = [
   ['فضلاء و طلبہ', ['فضلا', 'فاضلات', 'فاضل', 'طلبا', 'علما', 'عالمات']],
   ['یونیورسٹی تحقیق', ['یونیورسٹی', 'تحقیق', 'پی ایچ ڈی', 'ایم فل', 'اعلی تعلیم']],
@@ -35,24 +35,70 @@ const CONCEPTS = [
 const CORE_GROUPS = new Set(['یونیورسٹی تحقیق', 'ادارہ سازی', 'مشن و وژن', 'ادارہ حوالہ', 'مفت تربیت']);
 const JUNK_MARKERS = ['ہاہاہا', 'ھھھ', 'hahaha', 'lol'];
 
-function scoreVision(text) {
-  const norm = normalizeText(text);
-  const matched = CONCEPTS.filter(([, kws]) => kws.some((k) => norm.includes(normalizeText(k)))).map(([name]) => name);
-  const topical = matched.some((g) => CORE_GROUPS.has(g));
-  const institution = matched.includes('ادارہ حوالہ');
-  const junk = JUNK_MARKERS.some((m) => norm.includes(m));
-  let decision = 'borderline';
-  if (!junk && matched.length >= 3 && topical) decision = 'approve';
-  else if (matched.length <= 1 && !institution) decision = 'incomplete';
-  return { score: matched.length, matched, topical, institution, junk, decision };
+// Faithful port of the Python scorer's normalize_ur: NFKD, strip
+// tanwin/diacritics, collapse ي/ك/ة variants, drop ZWNJ/ZWJ, fold Urdu
+// and Arabic-Indic digits to Latin, punctuation -> space.
+function normalizeVision(s) {
+  let t = String(s || '').normalize('NFKD');
+  t = t.replace(/[\u064B-\u0652\u0670]/g, '');
+  t = t.replace(/\u064A/g, '\u06CC').replace(/\u0643/g, '\u06A9').replace(/\u0629/g, '\u06C1');
+  t = t.replace(/[\u200C\u200D]/g, '');
+  t = t.replace(/[۰-۹]/g, (c) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(c));
+  t = t.replace(/[٠-٩]/g, (c) => '٠١٢٣٤٥٦٧٨٩'.indexOf(c));
+  t = t.replace(/[^\p{L}\p{N}_\s]/gu, ' ');
+  return t.replace(/\s+/g, ' ').trim();
 }
 
-// A human "incomplete" decision is NEVER overridden by a later auto-review.
-// The caller must check user.visionReview.decision === 'incomplete' first
-// and skip scoring when it is set by a human (source === 'admin').
+function scoreVision(text) {
+  const norm = normalizeVision(text);
+  const padded = ' ' + norm + ' ';
+  const words = norm ? norm.split(' ') : [];
+  const matched = [];
+  for (const [name, kws] of CONCEPTS) {
+    for (const kw of kws) {
+      const nkw = normalizeVision(kw);
+      if (nkw && (padded.includes(' ' + nkw + ' ') || norm.startsWith(nkw + ' ')
+        || norm.endsWith(' ' + nkw) || words.includes(nkw))) {
+        matched.push(name);
+        break;
+      }
+    }
+  }
+  const topical = matched.some((g) => CORE_GROUPS.has(g));
+  const institution = matched.includes('ادارہ حوالہ');
+  // Junk detection — identical to the Python + in-app scorers: a single
+  // word dominating (>35%), a near-duplicate text (unique ratio <25%),
+  // or an explicit junk marker.
+  let junk = false;
+  let junkReason = '';
+  if (words.length) {
+    const freq = {};
+    let most = 0;
+    for (const w of words) { freq[w] = (freq[w] || 0) + 1; if (freq[w] > most) most = freq[w]; }
+    if (most / words.length > 0.35) { junk = true; junkReason = 'ایک ہی لفظ کی تکرار'; }
+    else if (Object.keys(freq).length / words.length < 0.25) { junk = true; junkReason = 'نقلی/دہرائی ہوئی عبارت'; }
+  }
+  if (!junk) {
+    for (const m of JUNK_MARKERS) {
+      if (norm.includes(normalizeVision(m))) { junk = true; junkReason = 'مذاق/فضول الفاظ'; break; }
+    }
+  }
+  // Decision order mirrors Python decide(): junk first, then approve,
+  // then the thin-text incomplete, else borderline for the human.
+  let decision = 'borderline';
+  if (junk) decision = 'incomplete';
+  else if (matched.length >= 3 && topical) decision = 'approve';
+  else if (matched.length <= 1 && !institution) decision = 'incomplete';
+  return { score: matched.length, matched, topical, institution, junk, junkReason, words: words.length, decision };
+}
+
+// Same hash the Python automation used (sha1 of the trimmed raw text,
+// first 10 hex chars) — one decision per text, and the deterministic
+// incomplete-notification id (incomplete-auto-<uid>-<hash>) matches the
+// old flow's documented format exactly.
 function visionHash(text) {
   const crypto = require('crypto');
-  return crypto.createHash('sha256').update(normalizeText(text)).digest('hex');
+  return crypto.createHash('sha1').update(String(text || '').trim()).digest('hex').slice(0, 10);
 }
 
 // ---------- profile gate ----------
@@ -183,7 +229,7 @@ function publicStudentView(user) {
 }
 
 module.exports = {
-  normalizeText, scoreVision, visionHash,
+  normalizeText, normalizeVision, scoreVision, visionHash,
   profileMissing, attendanceWindow, karachiNowMs,
   courseAttendedIds, bookAccessState, isAdmin, publicStudentView,
 };
