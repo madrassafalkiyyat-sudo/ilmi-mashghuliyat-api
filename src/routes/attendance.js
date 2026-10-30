@@ -54,9 +54,17 @@ router.get('/mine', async (req, res) => {
 // (UI: course-register view sets user.courseReg). The bridge routes the
 // UI's courseReg write here; without it the book/course-final gates,
 // which require courseReg, could never open from the UI.
+// ELIGIBILITY (Mufti 2026-10-30): only MPhil graduates and PhD students/
+// graduates may register — enforced HERE server-side (lib/course mirrors
+// the client's alumniStage rule), so a tampered client cannot register
+// an ineligible student. The client's own gate shows the same message.
 router.post('/course-register', async (req, res) => {
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
+  const courseLib = require('../lib/course');
+  if (!(await courseLib.courseEligible(db, user))) {
+    return fail(res, 403, 'not_eligible', courseLib.ELIGIBILITY_MSG);
+  }
   const set = { courseReg: true };
   if (!user.courseRegAt) set.courseRegAt = new Date().toISOString();
   await db.collection('users').updateOne({ _id: req.user._id }, { $set: set });
@@ -92,9 +100,13 @@ router.post('/claim', async (req, res) => {
   if (!sessionId || !code) return fail(res, 400, 'missing_fields', 'سیشن اور کوڈ درکار ہیں');
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
-  const registered = (user.sessionRegs && user.sessionRegs[sessionId]) || user.sessionReg === true;
-  if (!registered) return fail(res, 403, 'not_registered', 'پہلے سیشن میں رجسٹریشن کریں، پھر حاضری درج ہوگی');
   const session = await db.collection('courseSessions').findOne({ sessionId });
+  // Registration: the per-session map OR the legacy boolean. For a COURSE
+  // session, course registration itself is the registration (a registered
+  // course student is enrolled in every class of the batch).
+  const registered = (user.sessionRegs && user.sessionRegs[sessionId]) || user.sessionReg === true
+    || !!(session && user.courseReg);
+  if (!registered) return fail(res, 403, 'not_registered', 'پہلے سیشن میں رجسٹریشن کریں، پھر حاضری درج ہوگی');
   const live = !session && await db.collection('settings').findOne({ _id: 'session' });
   const target = session || live;
   if (!target) return fail(res, 404, 'not_found', 'سیشن نہیں ملا');
@@ -149,6 +161,10 @@ router.post('/verify', requireAdmin, async (req, res) => {
       await db.collection('users').updateOne(
         { email: claim.email }, { $set: { certIssued: true } }
       );
+    } else {
+      // Course points ledger: a verified course attendance is +10 points
+      // (recomputed from source, exactly-once by construction).
+      try { await require('../lib/course').recomputeCoursePoints(db, claim.email); } catch (e) { console.error('course points recompute failed:', e && e.message); }
     }
   }
   return res.json({ ok: true, status });

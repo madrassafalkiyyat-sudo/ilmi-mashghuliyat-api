@@ -7,11 +7,28 @@ const config = require('./config');
 const { getDb } = require('./db');
 
 async function main() {
-  await getDb();
+  const db = await getDb();
   app.listen(config.port, () => {
     console.log(`ilmi-mashghuliyat API listening on port ${config.port}`);
     console.log(`CORS origin: ${config.corsOrigin}`);
   });
+  // Idara Sazi course: seed batch 1 (sessions, codes, targeted launch
+  // announcement) and run the auto-release engine — at boot, then hourly.
+  // Everything is deterministic-id upserts, so restarts and repeats are
+  // no-ops; Render's free-tier sleep can only delay a release to the same
+  // day, and the boot run catches up immediately on wake.
+  const course = require('./lib/course');
+  const tick = async () => {
+    try {
+      await course.seedCourseBatch(db);
+      await course.runCourseReleases(db);
+    } catch (e) {
+      console.error('course tick failed:', e && e.message);
+    }
+  };
+  tick();
+  const timer = setInterval(tick, 60 * 60 * 1000);
+  if (timer.unref) timer.unref();
 }
 
 main().catch((err) => {

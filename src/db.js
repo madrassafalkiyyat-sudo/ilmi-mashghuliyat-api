@@ -27,6 +27,10 @@ async function ensureIndexes(db) {
   // One attendance claim per student per session.
   await db.collection('attendanceClaims').createIndex({ sessionId: 1, email: 1 }, { unique: true });
   await db.collection('sessionSecrets').createIndex({ sessionId: 1 }, { unique: true });
+  // Course classroom: one submission per (assignment, student); release
+  // scheduling scans assignments by release time.
+  await db.collection('assignmentSubmissions').createIndex({ assignmentId: 1, email: 1 }, { unique: true });
+  await db.collection('assignments').createIndex({ releaseAtMs: 1 });
   await db.collection('announcements').createIndex({ expiresAt: 1 });
   await db.collection('news').createIndex({ expiresAt: 1 });
   await db.collection('jobs').createIndex({ expiresAt: 1 });
