@@ -657,3 +657,28 @@ test('vision heal: verdict + name backfilled only where missing; idempotent; awa
   assert.equal(c2.namesFilled, 0, 'second run fills nothing');
   assert.equal(c2.reviewed, 0, 'second run reviews nothing — idempotent');
 });
+
+test('abstract endpoints: a valid JWT is required (401 without token)', async () => {
+  const t1 = await call('/api/help/abstract/themes', { method: 'POST', body: { language: 'en', conference: { title: 'Conf' } } });
+  assert.equal(t1.status, 401);
+  const t2 = await call('/api/help/abstract/write', { method: 'POST', body: { language: 'en', theme: 'Some theme' } });
+  assert.equal(t2.status, 401);
+});
+
+test('abstract endpoints: language + theme validation, honest 501 without a Gemini key', async () => {
+  await call('/api/auth/register', { method: 'POST', body: { email: 'abs@example.com', password: 'studentpass123', name: 'ایبسٹریکٹ طالب' } });
+  const t = await login('abs@example.com', 'studentpass123');
+  const badLang = await call('/api/help/abstract/themes', { method: 'POST', token: t, body: { language: 'fr' } });
+  assert.equal(badLang.status, 400);
+  assert.equal(badLang.data.error.code, 'bad_language');
+  const badLang2 = await call('/api/help/abstract/write', { method: 'POST', token: t, body: { language: '', theme: 'x' } });
+  assert.equal(badLang2.status, 400);
+  const noTheme = await call('/api/help/abstract/write', { method: 'POST', token: t, body: { language: 'en' } });
+  assert.equal(noTheme.status, 400);
+  assert.equal(noTheme.data.error.code, 'bad_theme');
+  const valid = await call('/api/help/abstract/themes', { method: 'POST', token: t, body: { language: 'ur', conference: { title: 'بین الاقوامی کانفرنس' } } });
+  assert.equal(valid.status, 501, 'valid input + valid token reaches the key check (no GEMINI_API_KEY in tests)');
+  assert.equal(valid.data.error.code, 'ai_not_configured');
+  const validWrite = await call('/api/help/abstract/write', { method: 'POST', token: t, body: { language: 'en', theme: 'AI in madrasa education' } });
+  assert.equal(validWrite.status, 501);
+});

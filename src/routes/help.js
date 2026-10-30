@@ -11,7 +11,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { verifyAccessToken } = require('../auth');
-const { fail } = require('../middleware/auth');
+const { fail, requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -111,7 +111,8 @@ function decodedBytes(b64) {
    the same model once, then moves on; any other HTTP error stops.
    An overall deadline caps the whole chain. Upstream bodies and the
    key are never forwarded to the client. */
-async function callGemini(apiKey, parts) {
+async function callGemini(apiKey, parts, opts) {
+  const o = opts || {};
   const primary = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const candidates = [];
   [primary, 'gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'].forEach((m) => {
@@ -119,7 +120,10 @@ async function callGemini(apiKey, parts) {
   });
   const body = JSON.stringify({
     contents: [{ role: 'user', parts }],
-    generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
+    generationConfig: {
+      temperature: typeof o.temperature === 'number' ? o.temperature : 0.3,
+      maxOutputTokens: typeof o.maxOutputTokens === 'number' ? o.maxOutputTokens : 1024,
+    },
   });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const deadline = Date.now() + 90000;
@@ -225,6 +229,181 @@ router.post('/ask', optionalAuth, helpLimiter, async (req, res) => {
     return fail(res, 502, 'ai_upstream', 'جواب حاصل نہیں ہو سکا — چند لمحے بعد دوبارہ کوشش کریں');
   }
   return res.json({ ok: true, answer });
+});
+
+/* ================================================================
+   PART A — Conference abstract builder (Mufti's order 2026-10-30)
+   POST /api/help/abstract/themes  -> exactly 3 theme proposals
+   POST /api/help/abstract/write   -> title + abstract + keywords
+   Unlike /ask these REQUIRE a valid JWT (logged-in students only,
+   enforced by the same requireAuth the rest of the API uses) and have
+   their own per-user daily bucket: 30 requests/day across BOTH
+   endpoints (themes + write share one counter, keyed by user id).
+   Validation runs BEFORE the API-key check so clients (and tests)
+   get the honest 400 for malformed input even when no key is set.
+   ================================================================ */
+const abstractLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  limit: 30,
+  keyGenerator: (req) => 'abs:' + (req.user && req.user._id ? req.user._id : req.ip),
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  handler: (req, res) => fail(res, 429, 'rate_limited', 'آج کے ایبسٹریکٹ کی حد پوری ہو گئی ہے — براہ کرم کل دوبارہ کوشش کریں'),
+});
+
+const ABS_LANGS = {
+  en: 'English',
+  ar: 'Arabic (العربية)',
+  ur: 'Urdu (اردو)',
+};
+const MAX_ADTEXT_CHARS = 6000;
+const MAX_THEME_CHARS = 300;
+const MAX_FIELD_CHARS = 500;
+
+function absStr(v, cap) {
+  return typeof v === 'string' ? v.trim().slice(0, cap) : '';
+}
+
+function absConference(body) {
+  const c = body && typeof body.conference === 'object' && body.conference !== null ? body.conference : {};
+  const conf = {
+    title: absStr(c.title, MAX_FIELD_CHARS),
+    details: absStr(c.details, 2500),
+    deadline: absStr(c.deadline, 200),
+    link: absStr(c.link, 500),
+  };
+  let confJson = '';
+  try { confJson = JSON.stringify(conf); } catch (e) { confJson = ''; }
+  if (confJson.length > MAX_CONTEXT_CHARS) confJson = confJson.slice(0, MAX_CONTEXT_CHARS);
+  return { conf, confJson };
+}
+
+// Models sometimes wrap JSON in ``` fences or add a line of prose;
+// take the outermost bracketed span and parse that.
+function looseJson(text, open, close) {
+  if (!text) return null;
+  const s = String(text).replace(/```(?:json)?/gi, '');
+  const a = s.indexOf(open);
+  const b = s.lastIndexOf(close);
+  if (a < 0 || b <= a) return null;
+  try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { return null; }
+}
+
+router.post('/abstract/themes', requireAuth, abstractLimiter, async (req, res) => {
+  const body = req.body || {};
+  const language = absStr(body.language, 10);
+  if (!ABS_LANGS[language]) {
+    return fail(res, 400, 'bad_language', 'زبان منتخب کریں — English، العربية یا اردو');
+  }
+  const topic = absStr(body.topic, MAX_FIELD_CHARS);
+  const area = absStr(body.area, MAX_FIELD_CHARS);
+  const adText = absStr(body.adText, MAX_ADTEXT_CHARS + 1);
+  if (adText.length > MAX_ADTEXT_CHARS) {
+    return fail(res, 400, 'bad_adtext', 'اشتہار کا متن بہت لمبا ہے — 6000 حروف سے کم رکھیں');
+  }
+  const img = parseAttachment(body.imageBase64, 'image');
+  if (img === 'bad') {
+    return fail(res, 400, 'bad_attachment', 'منسلک تصویر درست نہیں — دوبارہ لگا کر بھیجیں');
+  }
+  if (img && decodedBytes(img.data) > MAX_ATTACHMENT_BYTES) {
+    return fail(res, 413, 'payload_too_large', 'منسلک تصویر بہت بڑی ہے — سائز 4 MB سے کم رکھیں');
+  }
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return fail(res, 501, 'ai_not_configured', 'AI مدد ابھی فعال نہیں ہے — بعد میں دوبارہ کوشش کریں');
+  }
+  const { confJson } = absConference(body);
+  const prompt = [
+    'You are an academic research advisor for madrasa graduates (ulama) applying to academic conferences.',
+    `Propose EXACTLY 3 DISTINCT, specific research themes for a conference paper, in ${ABS_LANGS[language]}.`,
+    'Ground every theme ONLY in the conference information and the student context below. Each theme must be realistically researchable by this student and aligned with the conference.',
+    'Do NOT invent the student\'s name, results, data or references. Do not repeat the same idea in different words.',
+    'Respond with ONLY a JSON array of exactly 3 objects, each {"title": "...", "angle": "..."} — angle is ONE line explaining the research angle. No prose outside the JSON.',
+    '',
+    '=== Conference information (JSON) ===',
+    confJson || '{}',
+    '',
+    '=== Student context ===',
+    'Research area: ' + (area || '(not given)'),
+    'Topic of interest: ' + (topic || '(not given)'),
+    adText ? '\n=== Call for papers / additional text supplied by the student ===\n' + adText : '',
+  ].join('\n');
+  const parts = [{ text: prompt }];
+  if (img) parts.push({ inline_data: { mime_type: img.mime, data: img.data } });
+  const answer = await callGemini(apiKey, parts, { maxOutputTokens: 700, temperature: 0.5 });
+  if (!answer) {
+    return fail(res, 502, 'ai_upstream', 'جواب حاصل نہیں ہو سکا — چند لمحے بعد دوبارہ کوشش کریں');
+  }
+  const parsed = looseJson(answer, '[', ']');
+  const themes = Array.isArray(parsed)
+    ? parsed.filter((t) => t && typeof t.title === 'string' && t.title.trim())
+        .slice(0, 3)
+        .map((t) => ({ title: t.title.trim().slice(0, MAX_THEME_CHARS), angle: typeof t.angle === 'string' ? t.angle.trim().slice(0, MAX_THEME_CHARS) : '' }))
+    : [];
+  if (themes.length !== 3) {
+    console.error('help/abstract/themes: could not parse 3 themes from upstream answer');
+    return fail(res, 502, 'ai_upstream', 'جواب حاصل نہیں ہو سکا — چند لمحے بعد دوبارہ کوشش کریں');
+  }
+  return res.json({ ok: true, themes });
+});
+
+router.post('/abstract/write', requireAuth, abstractLimiter, async (req, res) => {
+  const body = req.body || {};
+  const language = absStr(body.language, 10);
+  if (!ABS_LANGS[language]) {
+    return fail(res, 400, 'bad_language', 'زبان منتخب کریں — English، العربية یا اردو');
+  }
+  const theme = absStr(body.theme, MAX_THEME_CHARS + 1);
+  if (!theme) {
+    return fail(res, 400, 'bad_theme', 'پہلے کوئی تھیم منتخب کریں');
+  }
+  if (theme.length > MAX_THEME_CHARS) {
+    return fail(res, 400, 'bad_theme', 'تھیم بہت لمبی ہے — 300 حروف سے کم رکھیں');
+  }
+  const topic = absStr(body.topic, MAX_FIELD_CHARS);
+  const area = absStr(body.area, MAX_FIELD_CHARS);
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return fail(res, 501, 'ai_not_configured', 'AI مدد ابھی فعال نہیں ہے — بعد میں دوبارہ کوشش کریں');
+  }
+  const { confJson } = absConference(body);
+  const prompt = [
+    'You are an academic writing assistant for madrasa graduates (ulama).',
+    `Write a formal academic conference ABSTRACT in ${ABS_LANGS[language]} on the selected theme below.`,
+    'Length: about 250–350 words. Structure, in flowing prose (no headings): background/context, the problem or gap, objectives, methodology, and the expected contribution.',
+    'Ground the abstract ONLY in the conference information and student context below. NEVER invent the student\'s name, findings, results, data, statistics or citations, and do NOT include a reference list.',
+    'If the context is thin, write at proposal level — aims, questions and method — instead of fabricating findings.',
+    'Respond with ONLY a JSON object {"title": "...", "abstract": "...", "keywords": ["...", "..."]} with 3–6 keywords. No prose outside the JSON.',
+    '',
+    '=== Selected theme ===',
+    theme,
+    '',
+    '=== Conference information (JSON) ===',
+    confJson || '{}',
+    '',
+    '=== Student context ===',
+    'Research area: ' + (area || '(not given)'),
+    'Topic of interest: ' + (topic || '(not given)'),
+  ].join('\n');
+  const answer = await callGemini(apiKey, [{ text: prompt }], { maxOutputTokens: 2000, temperature: 0.4 });
+  if (!answer) {
+    return fail(res, 502, 'ai_upstream', 'جواب حاصل نہیں ہو سکا — چند لمحے بعد دوبارہ کوشش کریں');
+  }
+  const parsed = looseJson(answer, '{', '}');
+  if (!parsed || typeof parsed.abstract !== 'string' || !parsed.abstract.trim()) {
+    console.error('help/abstract/write: could not parse abstract from upstream answer');
+    return fail(res, 502, 'ai_upstream', 'جواب حاصل نہیں ہو سکا — چند لمحے بعد دوبارہ کوشش کریں');
+  }
+  const keywords = Array.isArray(parsed.keywords)
+    ? parsed.keywords.filter((k) => typeof k === 'string' && k.trim()).slice(0, 6).map((k) => k.trim().slice(0, 80))
+    : [];
+  return res.json({
+    ok: true,
+    title: typeof parsed.title === 'string' && parsed.title.trim() ? parsed.title.trim().slice(0, MAX_THEME_CHARS) : theme,
+    abstract: parsed.abstract.trim().slice(0, 6000),
+    keywords,
+  });
 });
 
 module.exports = router;
