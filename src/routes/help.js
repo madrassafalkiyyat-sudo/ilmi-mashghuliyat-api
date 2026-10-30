@@ -406,4 +406,353 @@ router.post('/abstract/write', requireAuth, abstractLimiter, async (req, res) =>
   });
 });
 
+/* ================================================================
+   PART F — Guided form filling (Mufti, 2026-10-31)
+   POST /api/help/formfill {link?, imageBase64?, note?}
+   JWT REQUIRED (the answer sheet is built from the student's own
+   record). The endpoint NEVER submits anything anywhere and never
+   asks for external credentials: it reads the form's fields (from
+   the page HTML, or from a screenshot via Gemini vision), maps each
+   field to an answer taken ONLY from the student's own users doc
+   (+ values the student typed in `note`), and returns the ordered
+   answer sheet. A field the record cannot answer stays null — the
+   client shows «آپ کے پروفائل میں موجود نہیں — یہ خانہ خود بھریں».
+   ================================================================ */
+const formfillLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  limit: 20,
+  keyGenerator: (req) => 'ff:' + (req.user && req.user._id ? req.user._id : req.ip),
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  handler: (req, res) => fail(res, 429, 'rate_limited', 'آج کے فارم کی حد پوری ہو گئی ہے — براہ کرم کل دوبارہ کوشش کریں'),
+});
+
+const MAX_FORM_FIELDS = 60;
+
+/* --- link safety: http(s) only; loopback/private hosts blocked
+   (SSRF hygiene for a server-side fetch). Tests opt in explicitly
+   with ALLOW_LOCAL_FORM_FETCH=1 so fixtures can live on 127.0.0.1. */
+function formUrlAllowed(raw) {
+  let u;
+  try { u = new URL(String(raw || '')); } catch (e) { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = u.hostname.toLowerCase();
+  if (host === 'localhost' || host.endsWith('.local') || host === '::1') return false;
+  if (/^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) {
+    return process.env.ALLOW_LOCAL_FORM_FETCH === '1';
+  }
+  return true;
+}
+
+async function fetchFormHtml(link) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const resp = await fetch(link, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      redirect: 'follow',
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) return null;
+    const text = await resp.text();
+    return text.slice(0, 1500000); // ~1.5MB cap
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function htmlText(s) {
+  return String(s || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function inferKind(tagType, label) {
+  const t = String(tagType || '').toLowerCase();
+  const l = String(label || '').toLowerCase();
+  if (t === 'file') return 'file';
+  if (t === 'email' || /e-?mail|ای میل/.test(l)) return 'email';
+  if (t === 'tel' || /whats ?app|واٹس ایپ|mobile|phone|موبائل|فون|رابطہ/.test(l)) return 'phone';
+  if (t === 'date' || /date of birth|تاریخ پیدائش|پیدائش کی تاریخ/.test(l)) return 'date';
+  if (t === 'number') return 'number';
+  if (t === 'checkbox' || t === 'radio' || t === 'select') return 'choice';
+  if (t === 'textarea') return 'paragraph';
+  return 'text';
+}
+
+/* Google Forms pages carry their questions in an embedded
+   FB_PUBLIC_LOAD_DATA_ array. Walk it defensively: a question item
+   is an array whose [0] is a numeric id, [1] the title string and
+   [3] a numeric type code. Returns [] when the shape is absent. */
+function extractGoogleFormFields(html) {
+  const marker = html.indexOf('FB_PUBLIC_LOAD_DATA_');
+  if (marker < 0) return [];
+  const start = html.indexOf('[', marker);
+  if (start < 0) return [];
+  // Bracket-balance scan for the array literal (strings may hold ]).
+  let depth = 0; let inStr = false; let esc = false; let end = -1;
+  for (let i = start; i < html.length; i++) {
+    const c = html[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '[') depth++;
+    else if (c === ']') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end < 0) return [];
+  let data;
+  try { data = JSON.parse(html.slice(start, end + 1)); } catch (e) { return []; }
+  const typeKind = { 0: 'text', 1: 'paragraph', 2: 'choice', 3: 'choice', 4: 'choice', 9: 'date' };
+  const out = [];
+  const seen = new Set();
+  (function walk(node) {
+    if (!Array.isArray(node)) return;
+    if (typeof node[0] === 'number' && typeof node[1] === 'string' && typeof node[3] === 'number' && node[1].trim()) {
+      const label = node[1].trim();
+      if (!seen.has(label)) { seen.add(label); out.push({ label, kind: typeKind[node[3]] || 'text' }); }
+      return; // do not descend into a question's own sub-arrays
+    }
+    for (const child of node) walk(child);
+  })(data);
+  return out;
+}
+
+/* Generic HTML forms: labels + controls in document order. */
+function extractGenericFormFields(html) {
+  const cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ');
+  const labelsByFor = {};
+  let m;
+  const labelRe = /<label\b([^>]*)>([\s\S]*?)<\/label>/gi;
+  while ((m = labelRe.exec(cleaned))) {
+    const forM = m[1].match(/for\s*=\s*["']([^"']+)["']/i);
+    const txt = htmlText(m[2]);
+    if (forM && txt) labelsByFor[forM[1]] = txt;
+  }
+  const fields = [];
+  const ctrlRe = /<(input|textarea|select)\b([^>]*)>/gi;
+  while ((m = ctrlRe.exec(cleaned))) {
+    const tag = m[1].toLowerCase();
+    const attrs = m[2] || '';
+    const attr = (name) => {
+      const am = attrs.match(new RegExp(name + '\\s*=\\s*["\']([^"\']*)["\']', 'i'));
+      return am ? am[1].trim() : '';
+    };
+    const type = attr('type').toLowerCase() || (tag === 'input' ? 'text' : tag);
+    if (['hidden', 'submit', 'button', 'reset', 'image'].includes(type)) continue;
+    const id = attr('id');
+    let label = (id && labelsByFor[id]) || attr('placeholder') || attr('aria-label') || attr('name') || '';
+    if (!label) {
+      // Wrapping <label>…<input></label>: look backwards for an open label.
+      const before = cleaned.slice(Math.max(0, m.index - 400), m.index);
+      const open = before.lastIndexOf('<label');
+      if (open >= 0 && before.indexOf('</label>', open) < 0) label = htmlText(before.slice(open));
+    }
+    label = htmlText(label).slice(0, 200);
+    if (!label) continue;
+    fields.push({ label, kind: inferKind(type, label) });
+    if (fields.length >= MAX_FORM_FIELDS) break;
+  }
+  // Dedup consecutive identical labels (radio groups share one question).
+  return fields.filter((f, i) => i === 0 || f.label !== fields[i - 1].label);
+}
+
+function extractFormFields(html) {
+  const titleM = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  const title = htmlText(titleM ? titleM[1] : (h1M ? h1M[1] : '')).slice(0, 200);
+  let fields = extractGoogleFormFields(html);
+  if (!fields.length) fields = extractGenericFormFields(html);
+  return { title, fields: fields.slice(0, MAX_FORM_FIELDS) };
+}
+
+/* The student's own basics — top-level record fields first, then the
+   profile object (the app stores them in both places across eras). */
+function formProfile(user) {
+  const u = user || {};
+  const p = u.profile && typeof u.profile === 'object' ? u.profile : {};
+  const pick = (...vals) => {
+    for (const v of vals) if (typeof v === 'string' && v.trim()) return v.trim();
+    return '';
+  };
+  const prof = {
+    name: pick(u.name, p.name),
+    email: pick(u.email),
+    mobile: pick(u.mobile, p.mobile, p.whatsapp, u.whatsapp),
+    whatsapp: pick(p.whatsapp, u.whatsapp, u.mobile, p.mobile),
+    degree: pick(u.degree, p.degree),
+    dept: pick(u.dept, p.dept),
+    madrasa: pick(u.madrasa, p.madrasa),
+    university: pick(u.uni, p.uni, p.university),
+    country: pick(u.country, p.country),
+    admissionRoute: pick(u.admissionRoute, p.admissionRoute),
+    linkedin: pick(p.linkedin, u.linkedin),
+    scholar: pick(p.scholar, u.scholar),
+    cnic: pick(p.cnic, u.cnic),
+    fatherName: pick(p.fatherName, u.fatherName),
+    dob: pick(p.dob, p.dateOfBirth, u.dob),
+    address: pick(p.address, u.address),
+    semester: pick(p.semester, u.semester),
+    roll: pick(p.rollNumber, p.roll, u.rollNumber),
+  };
+  for (const k of Object.keys(prof)) if (!prof[k]) delete prof[k];
+  return prof;
+}
+
+/* Rule-based field → profile mapping. Order matters: specific
+   patterns (father, CNIC, WhatsApp) run before generic ones (name,
+   phone, university). A field with no confident rule — or whose
+   profile value is absent — stays null. NEVER invent a value. */
+const FORM_RULES = [
+  [/cnic|شناختی کارڈ|national id/i, 'cnic'],
+  [/father|والد/i, 'fatherName'],
+  [/date of birth|dob|تاریخ پیدائش|پیدائش/i, 'dob'],
+  [/e-?mail|ای میل/i, 'email'],
+  [/whats ?app|واٹس ایپ/i, 'whatsapp'],
+  [/linkedin|لنکڈن/i, 'linkedin'],
+  [/google scholar|scholar profile|سکالر/i, 'scholar'],
+  [/mobile|phone|contact|موبائل|رابطہ|فون/i, 'mobile'],
+  [/address|پتہ|رہائش/i, 'address'],
+  [/country|ملک/i, 'country'],
+  [/madrasa|مدرسہ|مدرسے/i, 'madrasa'],
+  [/semester|سمسٹر/i, 'semester'],
+  [/roll|رول نمبر/i, 'roll'],
+  [/department|شعبہ|discipline|field of study/i, 'dept'],
+  [/degree|ڈگری|program|پروگرام/i, 'degree'],
+  [/universit|یونیورسٹی|institution|ادارے کا نام/i, 'university'],
+  [/admission route|داخلے کا راستہ/i, 'admissionRoute'],
+  [/full name|your name|name|نام/i, 'name'],
+];
+
+function mapFieldsRule(fields, profile) {
+  return (fields || []).map((f) => {
+    if (f.kind === 'file') return { label: f.label, kind: f.kind, answer: null, source: null };
+    const label = String(f.label || '');
+    for (const [re, key] of FORM_RULES) {
+      if (re.test(label)) {
+        const v = profile[key];
+        return { label: f.label, kind: f.kind, answer: v ? v : null, source: v ? 'profile' : null };
+      }
+    }
+    return { label: f.label, kind: f.kind, answer: null, source: null };
+  });
+}
+
+/* AI refinement for fields the rules could not answer — ONLY when a
+   Gemini key exists, and mechanically honesty-checked: an answer is
+   accepted solely if it is a VERBATIM value from the student's
+   profile or a verbatim phrase from the student's own note. Anything
+   else the model returns is discarded and the field stays null. */
+async function refineWithAi(mapped, profile, note, apiKey) {
+  if (!apiKey) return mapped;
+  const open = mapped.filter((f) => f.answer == null && f.kind !== 'file');
+  if (!open.length) return mapped;
+  const prompt = [
+    'You match online-form fields to a student\'s own data. STRICT RULES:',
+    '- Answer a field ONLY by copying a value VERBATIM from the PROFILE values below, or a phrase VERBATIM from the student NOTE below.',
+    '- If neither contains the answer, return null for that field. NEVER invent, guess, reformat or combine values.',
+    'Respond with ONLY a JSON array [{"label": "...", "answer": "..." or null}] for exactly the FIELDS listed.',
+    '',
+    'PROFILE (JSON): ' + JSON.stringify(profile),
+    'NOTE: ' + (note || '(none)'),
+    'FIELDS: ' + JSON.stringify(open.map((f) => f.label)),
+  ].join('\n');
+  const ans = await callGemini(apiKey, [{ text: prompt }], { maxOutputTokens: 900, temperature: 0.1 });
+  const parsed = looseJson(ans, '[', ']');
+  if (!Array.isArray(parsed)) return mapped;
+  const profileValues = new Set(Object.values(profile));
+  const byLabel = new Map(parsed.filter((x) => x && typeof x.label === 'string').map((x) => [x.label, x.answer]));
+  return mapped.map((f) => {
+    if (f.answer != null || !byLabel.has(f.label)) return f;
+    const a = byLabel.get(f.label);
+    if (typeof a !== 'string' || !a.trim() || a.length > 300) return f;
+    const v = a.trim();
+    if (profileValues.has(v)) return { ...f, answer: v, source: 'profile' };
+    if (note && note.includes(v)) return { ...f, answer: v, source: 'note' };
+    return f;
+  });
+}
+
+router.post('/formfill', requireAuth, formfillLimiter, async (req, res) => {
+  const body = req.body || {};
+  const link = absStr(body.link, 1000);
+  const note = absStr(body.note, 1000);
+  const img = parseAttachment(body.imageBase64, 'image');
+  if (img === 'bad') {
+    return fail(res, 400, 'bad_attachment', 'منسلک تصویر درست نہیں — دوبارہ لگا کر بھیجیں');
+  }
+  if (!link && !img) {
+    return fail(res, 400, 'formfill_needs_input', 'فارم کا لنک یا اس کا اسکرین شاٹ — دونوں میں سے ایک درکار ہے');
+  }
+  if (img && decodedBytes(img.data) > MAX_ATTACHMENT_BYTES) {
+    return fail(res, 413, 'payload_too_large', 'منسلک تصویر بہت بڑی ہے — سائز 4 MB سے کم رکھیں');
+  }
+
+  let formTitle = '';
+  let fields = null;
+  if (link) {
+    if (!formUrlAllowed(link)) {
+      return fail(res, 400, 'bad_link', 'یہ لنک درست نہیں — مکمل آفیشل لنک (https…) لکھیں، یا فارم کا اسکرین شاٹ بھیجیں');
+    }
+    const html = await fetchFormHtml(link);
+    if (!html) {
+      return fail(res, 422, 'form_unreachable', 'فارم کا صفحہ کھل نہیں سکا — فارم کا اسکرین شاٹ اپ لوڈ کر کے کوشش کریں');
+    }
+    const ex = extractFormFields(html);
+    formTitle = ex.title;
+    fields = ex.fields;
+    if (!fields.length) {
+      return fail(res, 422, 'form_fields_not_found', 'اس صفحے پر فارم کے خانے نہیں مل سکے — فارم کا اسکرین شاٹ اپ لوڈ کر کے کوشش کریں');
+    }
+  } else {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return fail(res, 501, 'ai_not_configured', 'AI مدد ابھی فعال نہیں ہے — فی الحال فارم کا لنک استعمال کریں');
+    }
+    const prompt = [
+      'Look at this screenshot of an online form. List the form\'s fields IN ORDER, exactly as they appear.',
+      'Respond with ONLY a JSON object {"title": "the form/page title if visible, else empty string", "fields": [{"label": "field label/question text", "kind": "text|paragraph|choice|date|email|phone|number|file"}]}. Use kind "file" for document/photo upload fields. No prose outside the JSON.',
+    ].join('\n');
+    const parts = [{ text: prompt }, { inline_data: { mime_type: img.mime, data: img.data } }];
+    const ans = await callGemini(apiKey, parts, { maxOutputTokens: 1400, temperature: 0.1 });
+    if (!ans) {
+      return fail(res, 502, 'ai_upstream', 'جواب حاصل نہیں ہو سکا — چند لمحے بعد دوبارہ کوشش کریں');
+    }
+    const parsed = looseJson(ans, '{', '}');
+    const rawFields = parsed && Array.isArray(parsed.fields) ? parsed.fields : [];
+    fields = rawFields
+      .filter((f) => f && typeof f.label === 'string' && f.label.trim())
+      .slice(0, MAX_FORM_FIELDS)
+      .map((f) => ({ label: f.label.trim().slice(0, 200), kind: typeof f.kind === 'string' ? f.kind : 'text' }));
+    formTitle = parsed && typeof parsed.title === 'string' ? parsed.title.trim().slice(0, 200) : '';
+    if (!fields.length) {
+      return fail(res, 422, 'form_fields_not_found', 'اسکرین شاٹ میں فارم کے خانے واضح نہیں پڑھے جا سکے — صاف اور قریب سے لیا ہوا اسکرین شاٹ بھیجیں');
+    }
+  }
+
+  const profile = formProfile(req.user);
+  let mapped = mapFieldsRule(fields, profile);
+  mapped = await refineWithAi(mapped, profile, note, process.env.GEMINI_API_KEY);
+  return res.json({ ok: true, formTitle, fields: mapped });
+});
+
+router._test = { extractFormFields, extractGoogleFormFields, extractGenericFormFields, mapFieldsRule, formProfile, formUrlAllowed };
+
 module.exports = router;

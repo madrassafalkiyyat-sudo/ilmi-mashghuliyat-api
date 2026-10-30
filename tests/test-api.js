@@ -800,6 +800,84 @@ test('expiry guard: student feed hides expired conf/schol; admins unaffected; di
   assert.equal(aDirect.status, 200, 'admin direct link unaffected');
 });
 
+test('formfill: auth + input validation + unreachable link honesty', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const noTok = await call('/api/help/formfill', { method: 'POST', body: { link: 'https://example.com/f' } });
+  assert.equal(noTok.status, 401, 'JWT required');
+  const d = await db();
+  const { hashPassword } = require('../src/auth');
+  await d.collection('users').insertOne({
+    _id: 'ff-1', uid: 'ff-1', email: 'ff-student@example.com', name: 'FF Student',
+    status: 'approved', role: 'student', mobile: '03001234567', degree: 'ایم فل',
+    uni: 'IIUI', madrasa: 'Jamia Test', passwordHash: await hashPassword('ffpass1234'),
+    profile: { linkedin: 'https://www.linkedin.com/in/ffstudent', scholar: 'https://scholar.google.com/citations?user=FFTEST1234' },
+  });
+  const tok = await login('ff-student@example.com', 'ffpass1234');
+  const neither = await call('/api/help/formfill', { method: 'POST', token: tok, body: {} });
+  assert.equal(neither.status, 400);
+  assert.equal(neither.data.error.code, 'formfill_needs_input');
+  const dead = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: 'http://127.0.0.1:1/nope' } });
+  assert.equal(dead.status, 422, JSON.stringify(dead.data));
+  assert.equal(dead.data.error.code, 'form_unreachable');
+  const imgOnly = await call('/api/help/formfill', { method: 'POST', token: tok, body: { imageBase64: 'data:image/png;base64,iVBORw0KGgo=' } });
+  assert.equal(imgOnly.status, 501, 'no Gemini key in test env -> honest 501 for the image path');
+});
+
+test('formfill: generic HTML form — fields in order, answers only from the profile', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const http = require('node:http');
+  const fixture = `<html><head><title>HEC Scholarship Application Form</title></head><body><form>
+    <label for="fn">Full Name</label><input id="fn" type="text" name="fullname">
+    <label for="em">Email Address</label><input id="em" type="email">
+    <label for="cn">CNIC Number</label><input id="cn" type="text">
+    <label for="un">University</label><input id="un" type="text">
+    <label for="li">LinkedIn Profile</label><input id="li" type="text">
+    <label for="sop">Statement of Purpose</label><textarea id="sop"></textarea>
+    <input type="hidden" name="tok"><input type="submit" value="Send">
+    </form></body></html>`;
+  const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(fixture); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const tok = await login('ff-student@example.com', 'ffpass1234');
+    const r = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${srv.address().port}/form` } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.formTitle, 'HEC Scholarship Application Form');
+    assert.deepEqual(r.data.fields.map((f) => f.label), ['Full Name', 'Email Address', 'CNIC Number', 'University', 'LinkedIn Profile', 'Statement of Purpose']);
+    const byLabel = Object.fromEntries(r.data.fields.map((f) => [f.label, f]));
+    assert.equal(byLabel['Full Name'].answer, 'FF Student');
+    assert.equal(byLabel['Email Address'].answer, 'ff-student@example.com');
+    assert.equal(byLabel['University'].answer, 'IIUI');
+    assert.equal(byLabel['LinkedIn Profile'].answer, 'https://www.linkedin.com/in/ffstudent');
+    assert.equal(byLabel['CNIC Number'].answer, null, 'CNIC absent from the record -> null, never fabricated');
+    assert.equal(byLabel['Statement of Purpose'].answer, null);
+    assert.equal(byLabel['Statement of Purpose'].kind, 'paragraph');
+    assert.equal(byLabel['Email Address'].kind, 'email');
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+test('formfill: Google-Forms-like page — question titles extracted from the embedded data', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const http = require('node:http');
+  const fixture = `<html><head><title>Bright Scholarship — Application</title></head><body>
+    <script>var FB_PUBLIC_LOAD_DATA_ = [null,[[[111,"Email Address",null,0,[[222,null,0]]],[333,"Full Name",null,0,[[444,null,0]]],[555,"Why do you want this scholarship?",null,1,[[666,null,0]]]]],null];</script>
+    </body></html>`;
+  const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(fixture); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const tok = await login('ff-student@example.com', 'ffpass1234');
+    const r = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${srv.address().port}/gform` } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.deepEqual(r.data.fields.map((f) => f.label), ['Email Address', 'Full Name', 'Why do you want this scholarship?']);
+    assert.equal(r.data.fields[2].kind, 'paragraph');
+    assert.equal(r.data.fields[0].answer, 'ff-student@example.com');
+    assert.equal(r.data.fields[2].answer, null);
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
 test('abstract endpoints: a valid JWT is required (401 without token)', async () => {
   const t1 = await call('/api/help/abstract/themes', { method: 'POST', body: { language: 'en', conference: { title: 'Conf' } } });
   assert.equal(t1.status, 401);
