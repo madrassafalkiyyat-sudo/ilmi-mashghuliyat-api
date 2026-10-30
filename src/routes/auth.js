@@ -6,6 +6,7 @@
 // refused with code 'no_password_set' and the client offers the magic-link
 // or forgot-password flow instead.
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const { getDb } = require('../db');
 const { hashPassword, checkPassword, signAccessToken, hashToken, newRefreshToken } = require('../auth');
 const { fail } = require('../middleware/auth');
@@ -18,14 +19,35 @@ function publicUser(u) {
   return { uid: u._id, email: u.email, name: u.name, status: u.status || 'pending', role: u.role || 'student' };
 }
 
-async function issueSession(db, user, res) {
+async function issueSession(db, user, res, extra) {
   const refresh = newRefreshToken();
   const expires = new Date(Date.now() + config.refreshExpiresDays * 86400000);
   await db.collection('users').updateOne(
     { _id: user._id },
     { $push: { refreshTokens: { hash: hashToken(refresh), expiresAt: expires.toISOString() } } }
   );
-  return res.json({ accessToken: signAccessToken(user), refreshToken: refresh, user: publicUser(user) });
+  return res.json({ accessToken: signAccessToken(user), refreshToken: refresh, user: publicUser(user), ...(extra || {}) });
+}
+
+// Admin WITHOUT a users doc: the identity requireAuth already understands —
+// the access token carries sub 'admin:<email>' + the email, and
+// requireAuth resolves it against the admins collection alone. Refresh
+// hashes live on the admins doc itself (a users.updateOne would match
+// nothing); /refresh and /logout look there too.
+function syntheticAdminUser(adminDoc) {
+  const email = String(adminDoc._id).toLowerCase();
+  return { _id: `admin:${email}`, email, name: adminDoc.name || email, status: 'approved', role: 'admin' };
+}
+
+async function issueAdminOnlySession(db, adminDoc, res) {
+  const user = syntheticAdminUser(adminDoc);
+  const refresh = newRefreshToken();
+  const expires = new Date(Date.now() + config.refreshExpiresDays * 86400000);
+  await db.collection('admins').updateOne(
+    { _id: user.email },
+    { $push: { refreshTokens: { hash: hashToken(refresh), expiresAt: expires.toISOString() } } }
+  );
+  return res.json({ accessToken: signAccessToken(user), refreshToken: refresh, user: publicUser(user), isAdmin: true });
 }
 
 // POST /api/auth/register — creates a users doc in status 'pending'.
@@ -73,6 +95,50 @@ router.post('/login', async (req, res) => {
     return fail(res, 401, 'bad_credentials', 'ای میل یا پاس ورڈ غلط ہے');
   }
   return issueSession(db, user, res);
+});
+
+// POST /api/auth/admin-login — PASSWORDLESS admin entry (Mufti, 2026-10-30:
+// «ایڈمن کو تو ڈائریکٹ ای میل ڈالتے ہی ایپ کھل جانی چاہیے»). An admin who
+// types only their Gmail gets a full session — no password, no code —
+// because admins stuck on a forgotten password were delaying student
+// approvals. The ONLY source of truth is the server-side admins
+// collection (docs keyed by _id = lowercase email, same lookup isAdmin()
+// and requireAuth use); nothing about the list is ever returned.
+//   - admin WITH a users doc → the ordinary session for that doc (same
+//     tokens as password login), flagged isAdmin. Works even when the doc
+//     has no passwordHash or is still 'pending' — the exact stuck case.
+//   - admin WITHOUT a users doc → the synthetic admin identity (see
+//     issueAdminOnlySession above).
+//   - anyone else → the same generic bad-credentials failure as a wrong
+//     password; the response never confirms or denies list membership
+//     beyond what the flow itself shows, and never lists admins.
+// Students are untouched: their login still requires the password.
+// Stricter per-route limiter ON TOP of the global /api/auth limiter in
+// app.js — guessing admin emails is the only attack this opens.
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  handler: (req, res) => fail(res, 429, 'too_many_requests', 'بہت زیادہ کوششیں ہو گئی ہیں — کچھ دیر بعد دوبارہ کوشش کریں'),
+});
+router.post('/admin-login', adminLoginLimiter, async (req, res) => {
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+  const log = (result) => console.log(`admin-login email=${email || '(empty)'} result=${result} ip=${req.ip || ''}`);
+  if (!email) { log('missing_email'); return fail(res, 400, 'missing_fields', 'ای میل درکار ہے'); }
+  try {
+    const db = await getDb();
+    const adminDoc = EMAIL_RE.test(email) ? await db.collection('admins').findOne({ _id: email }) : null;
+    if (!adminDoc) { log('rejected'); return fail(res, 403, 'bad_credentials', 'ای میل یا پاس ورڈ غلط ہے'); }
+    const user = await db.collection('users').findOne({ email });
+    if (user) { log('ok_users_doc'); return issueSession(db, user, res, { isAdmin: true }); }
+    log('ok_admin_only');
+    return issueAdminOnlySession(db, adminDoc, res);
+  } catch (e) {
+    log('server_error');
+    return fail(res, 500, 'server_error', 'سرور کی خرابی');
+  }
 });
 
 // POST /api/auth/re-register — THE decided password-migration flow.
@@ -138,7 +204,21 @@ router.post('/refresh', async (req, res) => {
   const db = await getDb();
   const hash = hashToken(refreshToken);
   const user = await db.collection('users').findOne({ 'refreshTokens.hash': hash });
-  if (!user) return fail(res, 401, 'bad_token', 'ری فریش ٹوکن غلط ہے');
+  if (!user) {
+    // Admin without a users doc: their refresh hashes live on the admins
+    // doc (see /admin-login). Rotate exactly as for users — old hash
+    // revoked first, then a fresh pair.
+    const adminDoc = await db.collection('admins').findOne({ 'refreshTokens.hash': hash });
+    if (!adminDoc) return fail(res, 401, 'bad_token', 'ری فریش ٹوکن غلط ہے');
+    const aEntry = (adminDoc.refreshTokens || []).find((t) => t.hash === hash);
+    if (!aEntry || new Date(aEntry.expiresAt) < new Date()) {
+      return fail(res, 401, 'bad_token', 'ری فریش ٹوکن ختم ہو گیا ہے');
+    }
+    await db.collection('admins').updateOne(
+      { _id: adminDoc._id }, { $pull: { refreshTokens: { hash } } }
+    );
+    return issueAdminOnlySession(db, adminDoc, res);
+  }
   const entry = (user.refreshTokens || []).find((t) => t.hash === hash);
   if (!entry || new Date(entry.expiresAt) < new Date()) {
     return fail(res, 401, 'bad_token', 'ری فریش ٹوکن ختم ہو گیا ہے');
@@ -153,8 +233,14 @@ router.post('/logout', async (req, res) => {
   const { refreshToken } = req.body || {};
   if (refreshToken) {
     const db = await getDb();
+    const hash = hashToken(refreshToken);
     await db.collection('users').updateMany(
-      {}, { $pull: { refreshTokens: { hash: hashToken(refreshToken) } } }
+      {}, { $pull: { refreshTokens: { hash } } }
+    );
+    // Admin-only sessions keep their hashes on the admins doc (see
+    // /admin-login) — revoke there too so logout really ends the session.
+    await db.collection('admins').updateMany(
+      {}, { $pull: { refreshTokens: { hash } } }
     );
   }
   return res.json({ ok: true });
@@ -186,8 +272,8 @@ router.post('/reset-password', async (req, res) => {
 
 // Magic-link login — HONEST ERROR (2026-10-29): same reason as
 // forgot-password above. No email provider is wired, so no link is sent and
-// no token is stored. Staff/admins sign in with email + password (set once
-// via the re-register panel); the admin flag comes from the admins
+// no token is stored. Admins sign in passwordlessly via /admin-login
+// (Gmail only — Mufti, 2026-10-30); the admin flag comes from the admins
 // collection, not from any link.
 router.post('/magic-link', async (req, res) => {
   return fail(res, 501, 'email_not_configured', 'ای میل لنک کا راستہ بند ہے — لاگ ان اسکرین پر اپنی ایڈمن ای میل + نیا پاس ورڈ سے داخل ہوں (پہلی بار سنہری بٹن سے پاس ورڈ بنائیں)');

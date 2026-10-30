@@ -471,3 +471,71 @@ test('course attendance: courseReg counts as registration; verified claim adds +
   const board = await call('/api/course/leaderboard', { token: stuTok });
   assert.ok(board.data.leaderboard.some((b) => b.totalPoints >= 10));
 });
+
+test('admin-login: admin WITHOUT a users doc gets a passwordless session (refresh rotates, logout revokes)', async () => {
+  const d = await db();
+  await d.collection('admins').insertOne({ _id: 'boss@example.com' });
+  const r = await call('/api/auth/admin-login', { method: 'POST', body: { email: '  Boss@Example.COM ' } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.isAdmin, true);
+  assert.ok(r.data.accessToken && r.data.refreshToken, 'same token pair shape as password login');
+  assert.equal(r.data.user.email, 'boss@example.com');
+  const me = await call('/api/users/me', { token: r.data.accessToken });
+  assert.equal(me.status, 200);
+  assert.equal(me.data.isAdmin, true, 'middleware must resolve the synthetic admin identity');
+  const adm = await call('/api/admin/users?limit=5', { token: r.data.accessToken });
+  assert.equal(adm.status, 200, 'admin-only session must reach admin routes');
+  // Refresh rotation works for admin-only sessions (hashes live on the
+  // admins doc, not in users).
+  const rot = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: r.data.refreshToken } });
+  assert.equal(rot.status, 200, JSON.stringify(rot.data));
+  assert.equal(rot.data.isAdmin, true);
+  const stale = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: r.data.refreshToken } });
+  assert.equal(stale.status, 401, 'old admin refresh token must be revoked after rotation');
+  await call('/api/auth/logout', { method: 'POST', body: { refreshToken: rot.data.refreshToken } });
+  const afterLogout = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: rot.data.refreshToken } });
+  assert.equal(afterLogout.status, 401, 'logged-out admin refresh token must be revoked');
+});
+
+test('admin-login: admin WITH a users doc but no password (the stuck case) gets in', async () => {
+  const d = await db();
+  await d.collection('admins').insertOne({ _id: 'chief@example.com' });
+  await seedUser({
+    _id: 'chief-1', uid: 'chief-1', email: 'chief@example.com',
+    name: 'Chief Admin', status: 'pending', role: 'student', profile: {},
+  });
+  // Password login honestly refuses (no password was ever set) — this is
+  // exactly the admin Mufti described, stuck while approvals wait.
+  const pw = await call('/api/auth/login', { method: 'POST', body: { email: 'chief@example.com', password: 'whatever123' } });
+  assert.equal(pw.status, 403);
+  assert.equal(pw.data.error.code, 'no_password_set');
+  const r = await call('/api/auth/admin-login', { method: 'POST', body: { email: 'chief@example.com' } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.isAdmin, true);
+  assert.equal(r.data.user.uid, 'chief-1', 'session must be issued for the real users doc');
+  const me = await call('/api/users/me', { token: r.data.accessToken });
+  assert.equal(me.status, 200);
+  assert.equal(me.data.isAdmin, true);
+  // ...and the session survives a refresh, like any other login.
+  const rot = await call('/api/auth/refresh', { method: 'POST', body: { refreshToken: r.data.refreshToken } });
+  assert.equal(rot.status, 200);
+});
+
+test('admin-login: non-admin emails rejected generically; student password login untouched', async () => {
+  const reg = await call('/api/auth/register', { method: 'POST', body: { email: 'plain-student@example.com', password: 'studentpass123', name: 'Plain' } });
+  assert.equal(reg.status, 201);
+  for (const email of ['plain-student@example.com', 'nobody@example.com', 'not-an-email']) {
+    const r = await call('/api/auth/admin-login', { method: 'POST', body: { email } });
+    assert.equal(r.status, 403, email);
+    assert.equal(r.data.error.code, 'bad_credentials', 'same generic failure as a wrong password');
+    assert.equal(r.data.accessToken, undefined);
+  }
+  const missing = await call('/api/auth/admin-login', { method: 'POST', body: {} });
+  assert.equal(missing.status, 400);
+  // The student themself still logs in with the password — and only with it.
+  const ok = await call('/api/auth/login', { method: 'POST', body: { email: 'plain-student@example.com', password: 'studentpass123' } });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.data.isAdmin, undefined, 'normal login response shape unchanged for students');
+  const bad = await call('/api/auth/login', { method: 'POST', body: { email: 'plain-student@example.com', password: '' } });
+  assert.equal(bad.status, 400, 'an empty password must never log a student in');
+});
