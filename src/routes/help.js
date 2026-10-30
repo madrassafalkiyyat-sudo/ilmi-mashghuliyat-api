@@ -445,7 +445,7 @@ function formUrlAllowed(raw) {
   return true;
 }
 
-async function fetchFormHtml(link) {
+async function fetchFormPage(link) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {
@@ -459,12 +459,28 @@ async function fetchFormHtml(link) {
     });
     if (!resp.ok) return null;
     const text = await resp.text();
-    return text.slice(0, 1500000); // ~1.5MB cap
+    return { html: text.slice(0, 1500000), headers: resp.headers }; // ~1.5MB cap
   } catch (e) {
     return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/* Can this page be shown inside the app's <iframe> at all? Decided from
+   the FINAL response headers (after redirects): X-Frame-Options DENY /
+   SAMEORIGIN, or a CSP frame-ancestors directive that does not wildcard-
+   allow framing, mean the browser would show its own raw error document
+   («refused to connect») — the client must render our friendly blocked
+   panel instead and never create the iframe (Mufti, 2026-10-31, AIOU). */
+function frameEmbeddable(headers) {
+  if (!headers || typeof headers.get !== 'function') return true;
+  const xfo = String(headers.get('x-frame-options') || '').toUpperCase();
+  if (/\bDENY\b/.test(xfo) || /\bSAMEORIGIN\b/.test(xfo)) return false;
+  const csp = String(headers.get('content-security-policy') || '');
+  const m = csp.match(/frame-ancestors([^;]*)/i);
+  if (m && !m[1].includes('*')) return false;
+  return true;
 }
 
 function htmlText(s) {
@@ -482,6 +498,7 @@ function htmlText(s) {
 function inferKind(tagType, label) {
   const t = String(tagType || '').toLowerCase();
   const l = String(label || '').toLowerCase();
+  if (t === 'password') return 'password';
   if (t === 'file') return 'file';
   if (t === 'email' || /e-?mail|ای میل/.test(l)) return 'email';
   if (t === 'tel' || /whats ?app|واٹس ایپ|mobile|phone|موبائل|فون|رابطہ/.test(l)) return 'phone';
@@ -574,6 +591,22 @@ function extractGenericFormFields(html) {
   return fields.filter((f, i) => i === 0 || f.label !== fields[i - 1].label);
 }
 
+/* Login-page recognition (Mufti, 2026-10-31): the AIOU link students
+   open is the portal's LOGIN page — its «fields» are just user id +
+   password. Such a page is not a fillable form: the session must lead
+   with the login step (door attached), never present credential fields
+   as fillable. Signal: a password-type (or password-labelled) field in
+   a TINY field set — a long application form that happens to include
+   an account-password field is not a login page. */
+function isPasswordField(f) {
+  return !!f && (f.kind === 'password' || /password|پاس ورڈ/i.test(String(f.label || '')));
+}
+function detectLoginPage(fields) {
+  const fs = fields || [];
+  if (!fs.length || fs.length > 5) return false;
+  return fs.some(isPasswordField);
+}
+
 function extractFormFields(html) {
   const titleM = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const h1M = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
@@ -644,6 +677,7 @@ const FORM_RULES = [
 function mapFieldsRule(fields, profile) {
   return (fields || []).map((f) => {
     if (f.kind === 'file') return { label: f.label, kind: f.kind, answer: null, source: null };
+    if (isPasswordField(f)) return { label: f.label, kind: 'password', answer: null, source: null }; // credentials are NEVER mapped or filled
     const label = String(f.label || '');
     for (const [re, key] of FORM_RULES) {
       if (re.test(label)) {
@@ -662,7 +696,7 @@ function mapFieldsRule(fields, profile) {
    else the model returns is discarded and the field stays null. */
 async function refineWithAi(mapped, profile, note, apiKey) {
   if (!apiKey) return mapped;
-  const open = mapped.filter((f) => f.answer == null && f.kind !== 'file');
+  const open = mapped.filter((f) => f.answer == null && f.kind !== 'file' && f.kind !== 'password');
   if (!open.length) return mapped;
   const prompt = [
     'You match online-form fields to a student\'s own data. STRICT RULES:',
@@ -707,15 +741,17 @@ router.post('/formfill', requireAuth, formfillLimiter, async (req, res) => {
 
   let formTitle = '';
   let fields = null;
+  let embeddable = null; // link path only: can the page be framed in-app?
   if (link) {
     if (!formUrlAllowed(link)) {
       return fail(res, 400, 'bad_link', 'یہ لنک درست نہیں — مکمل آفیشل لنک (https…) لکھیں، یا فارم کا اسکرین شاٹ بھیجیں');
     }
-    const html = await fetchFormHtml(link);
-    if (!html) {
+    const page = await fetchFormPage(link);
+    if (!page) {
       return fail(res, 422, 'form_unreachable', 'فارم کا صفحہ کھل نہیں سکا — فارم کا اسکرین شاٹ اپ لوڈ کر کے کوشش کریں');
     }
-    const ex = extractFormFields(html);
+    embeddable = frameEmbeddable(page.headers);
+    const ex = extractFormFields(page.html);
     formTitle = ex.title;
     fields = ex.fields;
     if (!fields.length) {
@@ -747,12 +783,19 @@ router.post('/formfill', requireAuth, formfillLimiter, async (req, res) => {
     }
   }
 
+  /* Login page? Then there is no answer sheet to build — the session
+     leads with the login step; the portal's own credential fields are
+     never returned as fillable fields. */
+  if (detectLoginPage(fields)) {
+    return res.json({ ok: true, formTitle, fields: [], embeddable, loginFirst: true });
+  }
+
   const profile = formProfile(req.user);
   let mapped = mapFieldsRule(fields, profile);
   mapped = await refineWithAi(mapped, profile, note, process.env.GEMINI_API_KEY);
-  return res.json({ ok: true, formTitle, fields: mapped });
+  return res.json({ ok: true, formTitle, fields: mapped, embeddable, loginFirst: false });
 });
 
-router._test = { extractFormFields, extractGoogleFormFields, extractGenericFormFields, mapFieldsRule, formProfile, formUrlAllowed };
+router._test = { extractFormFields, extractGoogleFormFields, extractGenericFormFields, mapFieldsRule, formProfile, formUrlAllowed, frameEmbeddable, detectLoginPage, isPasswordField };
 
 module.exports = router;

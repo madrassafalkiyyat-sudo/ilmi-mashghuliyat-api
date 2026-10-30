@@ -878,6 +878,64 @@ test('formfill: Google-Forms-like page — question titles extracted from the em
   }
 });
 
+test('formfill: embeddable decided from framing headers (XFO / CSP frame-ancestors)', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const http = require('node:http');
+  const form = `<html><head><title>Portal Form</title></head><body><form>
+    <label for="fn">Full Name</label><input id="fn" type="text">
+    <label for="em">Email Address</label><input id="em" type="email">
+    </form></body></html>`;
+  const srv = http.createServer((req, res) => {
+    const extra = {
+      '/xfo-deny': { 'X-Frame-Options': 'DENY' },
+      '/xfo-same': { 'X-Frame-Options': 'SAMEORIGIN' },
+      '/csp-self': { 'Content-Security-Policy': "frame-ancestors 'self'" },
+      '/csp-star': { 'Content-Security-Policy': 'frame-ancestors *' },
+      '/plain': {},
+    }[req.url] || {};
+    res.writeHead(200, Object.assign({ 'Content-Type': 'text/html' }, extra));
+    res.end(form);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const tok = await login('ff-student@example.com', 'ffpass1234');
+    const port = srv.address().port;
+    const call1 = (p) => call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${port}${p}` } });
+    assert.equal((await call1('/xfo-deny')).data.embeddable, false, 'XFO DENY -> not embeddable');
+    assert.equal((await call1('/xfo-same')).data.embeddable, false, 'XFO SAMEORIGIN -> not embeddable');
+    assert.equal((await call1('/csp-self')).data.embeddable, false, "CSP frame-ancestors 'self' -> not embeddable");
+    assert.equal((await call1('/csp-star')).data.embeddable, true, 'CSP frame-ancestors * -> embeddable');
+    const plain = await call1('/plain');
+    assert.equal(plain.data.embeddable, true, 'no framing headers -> embeddable');
+    assert.equal(plain.data.loginFirst, false, 'ordinary form is not a login page');
+    assert.equal(plain.data.fields.length, 2);
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
+test('formfill: a portal LOGIN page is flagged loginFirst and its credential fields are never returned as fillable', async () => {
+  process.env.ALLOW_LOCAL_FORM_FETCH = '1';
+  const http = require('node:http');
+  const loginPage = `<html><head><title>AIOU Student Portal — Login</title></head><body><form>
+    <label for="uid">User ID</label><input id="uid" type="text" name="userid">
+    <label for="pw">Password</label><input id="pw" type="password" name="password">
+    <input type="submit" value="Login">
+    </form></body></html>`;
+  const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(loginPage); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const tok = await login('ff-student@example.com', 'ffpass1234');
+    const r = await call('/api/help/formfill', { method: 'POST', token: tok, body: { link: `http://127.0.0.1:${srv.address().port}/login` } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.loginFirst, true, 'tiny user+password set -> loginFirst');
+    assert.equal(r.data.fields.length, 0, 'no fillable fields are returned for a login page');
+    assert.ok(!JSON.stringify(r.data.fields).match(/password/i), 'password field never present');
+  } finally {
+    await new Promise((r) => srv.close(r));
+  }
+});
+
 test('abstract endpoints: a valid JWT is required (401 without token)', async () => {
   const t1 = await call('/api/help/abstract/themes', { method: 'POST', body: { language: 'en', conference: { title: 'Conf' } } });
   assert.equal(t1.status, 401);
