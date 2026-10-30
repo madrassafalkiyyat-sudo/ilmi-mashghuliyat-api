@@ -164,6 +164,47 @@ router.post('/admin-login', adminLoginLimiter, async (req, res) => {
   }
 });
 
+// POST /api/auth/student-login — GMAIL-ONLY entry for EXISTING students
+// (Mufti, 2026-10-31: migrated students were stuck at the re-register
+// panel — typing Gmail + a new password did not open the app). Mirror of
+// /admin-login with the source of truth flipped: an email that has a
+// users record gets a full session with NO password and NO re-register
+// step. Entry is NOT approval: pending records land on the pending
+// screen and rejected on theirs, exactly as password login routes them.
+// A password set earlier keeps working — /login is untouched as the
+// fallback. Unknown email → the same generic rejection as a wrong
+// password; the response never confirms whether any record exists
+// beyond what the flow itself shows. (Lookup is by the email FIELD —
+// users docs carry generated _ids, unlike admins docs which are keyed
+// by email; every other student lookup in this file uses {email} too.)
+const studentLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  handler: (req, res) => fail(res, 429, 'too_many_requests', 'بہت زیادہ کوششیں ہو گئی ہیں — کچھ دیر بعد دوبارہ کوشش کریں'),
+});
+router.post('/student-login', studentLoginLimiter, async (req, res) => {
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+  const log = (result) => console.log(`student-login email=${email || '(empty)'} result=${result} ip=${req.ip || ''}`);
+  if (!email) { log('missing_email'); return fail(res, 400, 'missing_fields', 'ای میل درکار ہے'); }
+  try {
+    const db = await getDb();
+    const user = EMAIL_RE.test(email) ? await db.collection('users').findOne({ email }) : null;
+    if (!user) { log('rejected'); return fail(res, 403, 'bad_credentials', 'ای میل یا پاس ورڈ غلط ہے'); }
+    // isAdmin computed as usual (admins collection) so the payload is
+    // sane even if this endpoint is hit first; the client still tries
+    // /admin-login first, which is the richer admin path.
+    const adminDoc = await db.collection('admins').findOne({ _id: email });
+    log('ok');
+    return issueSession(db, user, res, adminDoc ? { isAdmin: true } : undefined);
+  } catch (e) {
+    log('server_error');
+    return fail(res, 500, 'server_error', 'سرور کی خرابی');
+  }
+});
+
 // POST /api/auth/re-register — THE decided password-migration flow.
 // Migrated users docs have NO passwordHash (Firebase passwords cannot
 // move). A student submits their REGISTERED email + a new password:

@@ -590,6 +590,52 @@ test('admin-login: non-admin emails rejected generically; student password login
 const VISION_APPROVE_TEXT = 'میں یونیورسٹی میں تحقیق کرنا چاہتا ہوں اور مدرسہ ڈاٹ پی کے کے ساتھ مل کر ادارہ سازی کے لیے مفت تربیت دینا چاہتا ہوں';
 const VISION_BORDERLINE_TEXT = 'میں یونیورسٹی میں تحقیق کرنا چاہتا ہوں اور مدرسہ میں پڑھاتا ہوں';
 
+test('student-login: existing approved student enters with Gmail alone (Mufti 2026-10-31)', async () => {
+  const r = await call('/api/auth/student-login', { method: 'POST', body: { email: '  Approved-Old@Example.COM ' } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(r.data.accessToken && r.data.refreshToken, 'standard session pair');
+  assert.equal(r.data.user.status, 'approved');
+  const me = await call('/api/users/me', { token: r.data.accessToken });
+  assert.equal(me.status, 200, 'issued access token must work');
+});
+
+test('student-login: pending + rejected records enter too — entry is not approval', async () => {
+  await seedUser({ _id: 'pend-sl', uid: 'pend-sl', email: 'pending-student@example.com', name: 'Pending One', status: 'pending', role: 'student', profile: {} });
+  await seedUser({ _id: 'rej-sl', uid: 'rej-sl', email: 'rejected-student@example.com', name: 'Rejected One', status: 'rejected', role: 'student', profile: {} });
+  const p = await call('/api/auth/student-login', { method: 'POST', body: { email: 'pending-student@example.com' } });
+  assert.equal(p.status, 200, JSON.stringify(p.data));
+  assert.equal(p.data.user.status, 'pending', 'status preserved — pending screen routing is the client\u2019s job');
+  const rj = await call('/api/auth/student-login', { method: 'POST', body: { email: 'rejected-student@example.com' } });
+  assert.equal(rj.status, 200);
+  assert.equal(rj.data.user.status, 'rejected');
+});
+
+test('student-login: unknown email -> generic 403, nothing revealed', async () => {
+  const r = await call('/api/auth/student-login', { method: 'POST', body: { email: 'nobody-here@example.com' } });
+  assert.equal(r.status, 403);
+  assert.equal(r.data.error.code, 'bad_credentials');
+});
+
+test('student-login: an email that is also an admin keeps isAdmin in the payload', async () => {
+  const d = await db();
+  await d.collection('admins').insertOne({ _id: 'dual@example.com' });
+  await seedUser({ _id: 'dual-1', uid: 'dual-1', email: 'dual@example.com', name: 'Dual Role', status: 'approved', role: 'student', profile: {} });
+  const r = await call('/api/auth/student-login', { method: 'POST', body: { email: 'dual@example.com' } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.isAdmin, true, 'admin flag computed as usual even on the student path');
+  const me = await call('/api/users/me', { token: r.data.accessToken });
+  assert.equal(me.data.isAdmin, true);
+});
+
+test('student-login: per-route rate limit trips under hammering', async () => {
+  const statuses = [];
+  for (let i = 0; i < 40; i++) {
+    const r = await call('/api/auth/student-login', { method: 'POST', body: { email: `rl-probe-${i}@example.com` } });
+    statuses.push(r.status);
+  }
+  assert.ok(statuses.includes(429), 'route limiter (30/15min) must trip; got: ' + statuses.join(','));
+});
+
 test('register: name + form fields + vision persist; matching vision auto-approves + welcome notification (Mufti 2026-10-30)', async () => {
   const r = await call('/api/auth/register', {
     method: 'POST',
