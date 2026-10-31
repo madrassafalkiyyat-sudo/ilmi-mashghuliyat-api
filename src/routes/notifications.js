@@ -16,7 +16,7 @@ router.get('/', async (req, res) => {
   const filter = { email: req.user.email };
   if (req.query.unread === '1') filter.read = false;
   const docs = await db.collection('notifications')
-    .find(filter).sort({ date: -1 }).limit(200).toArray();
+    .find(filter).sort({ createdAt: -1, _id: -1 }).limit(200).toArray();
   return res.json({ docs });
 });
 

@@ -11,6 +11,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, requireApproved, fail } = require('../middleware/auth');
 const course = require('../lib/course');
+const { notifyOnce } = require('../lib/notify');
 
 const router = express.Router();
 router.use(requireAuth, requireApproved);
@@ -157,18 +158,12 @@ router.post('/admin/grade', async (req, res) => {
   );
   const points = await course.recomputeCoursePoints(db, sub.email);
   const nid = `asg-grade-${submissionId}-${m}`;
-  await db.collection('notifications').updateOne(
-    { email: sub.email, id: nid },
-    {
-      $setOnInsert: {
-        _id: nid, id: nid, email: sub.email, kind: 'grade', read: false,
-        date: new Date().toISOString(),
-        title: '🏅 مشق کے نمبر لگ گئے — ادارہ سازی کورس',
-        body: `«${(asg && asg.title) || 'مشق'}» میں آپ کو ${m}${max ? '/' + max : ''} نمبر ملے۔${sub.late ? ' (تاخیر سے جمع — پوائنٹس نصف شمار ہوئے)' : ''} تفصیل «اسائنمنٹس» میں دیکھیں۔`,
-      },
-    },
-    { upsert: true }
-  );
+  await notifyOnce(db, {
+    id: nid, email: sub.email, kind: 'grade', read: false,
+    date: new Date().toISOString(),
+    title: '🏅 مشق کے نمبر لگ گئے — ادارہ سازی کورس',
+    body: `«${(asg && asg.title) || 'مشق'}» میں آپ کو ${m}${max ? '/' + max : ''} نمبر ملے۔${sub.late ? ' (تاخیر سے جمع — پوائنٹس نصف شمار ہوئے)' : ''} تفصیل «اسائنمنٹس» میں دیکھیں۔`,
+  });
   return res.json({ ok: true, marks: m, points });
 });
 

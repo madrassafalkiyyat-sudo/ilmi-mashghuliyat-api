@@ -274,5 +274,5 @@ test('indexes: refresh-token hash lookups and newest-first notifications are ind
   const keys = async (c) => (await d.collection(c).indexes()).map((i) => JSON.stringify(i.key));
   assert.ok((await keys('users')).includes('{"refreshTokens.hash":1}'));
   assert.ok((await keys('admins')).includes('{"refreshTokens.hash":1}'));
-  assert.ok((await keys('notifications')).includes('{"email":1,"date":-1}'));
+  assert.ok((await keys('notifications')).includes('{"email":1,"createdAt":-1}'));
 });

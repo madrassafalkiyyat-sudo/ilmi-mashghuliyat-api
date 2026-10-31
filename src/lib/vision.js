@@ -34,13 +34,7 @@ function urduDate(d) {
   try { return new Intl.DateTimeFormat('ur-PK').format(d || new Date()); } catch (e) { return ''; }
 }
 
-async function notifyOnce(db, doc) {
-  await db.collection('notifications').updateOne(
-    { email: doc.email, id: doc.id },
-    { $setOnInsert: { _id: doc.id, ...doc } },
-    { upsert: true }
-  );
-}
+const { notifyOnce } = require('./notify');
 
 function incompleteReasonText(result) {
   let t = 'وژن کا خلاصہ درست نہیں — خلاصے میں ادارے کے وژن کا اپنا تصور واضح نہیں';

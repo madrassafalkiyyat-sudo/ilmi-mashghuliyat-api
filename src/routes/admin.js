@@ -7,6 +7,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, fail } = require('../middleware/auth');
 const { scoreVision } = require('../lib/rules');
+const { notifyOnce } = require('../lib/notify');
 const { stripSecrets, isLite, isDataUri, signature, slimUserPhoto, slimSessionPoster } = require('../lib/slim');
 
 const router = express.Router();
@@ -102,17 +103,11 @@ async function decide(req, res, status) {
   await db.collection('users').updateOne({ _id: id }, update);
   // Exactly-once notification for the decision.
   const notifId = `${status}-${id}`;
-  await db.collection('notifications').updateOne(
-    { email: user.email, id: notifId },
-    {
-      $setOnInsert: {
-        _id: notifId, id: notifId, email: user.email,
-        title: status === 'approved' ? 'منظوری' : status === 'rejected' ? 'مسترد' : 'نامکمل',
-        body: reason || '', date: new Date().toISOString(), read: false, kind: 'decision',
-      },
-    },
-    { upsert: true }
-  );
+  await notifyOnce(db, {
+    id: notifId, email: user.email,
+    title: status === 'approved' ? 'منظوری' : status === 'rejected' ? 'مسترد' : 'نامکمل',
+    body: reason || '', date: new Date().toISOString(), read: false, kind: 'decision',
+  });
   // For incomplete the stored status is unchanged (still pending) — report
   // that, not the decision name, so API clients never see a phantom status.
   return res.json({ ok: true, status: status === 'incomplete' ? user.status : status });
@@ -145,17 +140,11 @@ router.post('/notify', async (req, res) => {
   if (!doc.email || !doc.title) return fail(res, 400, 'bad_request', 'ای میل اور عنوان درکار ہیں');
   const db = await getDb();
   const id = doc.id || `n${Date.now().toString(36)}`;
-  await db.collection('notifications').updateOne(
-    { email: String(doc.email).toLowerCase(), id },
-    {
-      $setOnInsert: {
-        _id: id, id, email: String(doc.email).toLowerCase(),
-        title: doc.title, body: doc.body || '', kind: doc.kind || 'general',
-        date: doc.date || new Date().toISOString(), read: false,
-      },
-    },
-    { upsert: true }
-  );
+  await notifyOnce(db, {
+    id, email: doc.email,
+    title: doc.title, body: doc.body || '', kind: doc.kind || 'general',
+    date: doc.date || new Date().toISOString(), read: false,
+  });
   return res.json({ ok: true, id });
 });
 

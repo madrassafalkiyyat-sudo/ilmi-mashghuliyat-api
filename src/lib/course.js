@@ -14,6 +14,7 @@
 //  - Points: verified course attendance = +10 per session; a graded in-app
 //    assignment adds its obtained marks as points; a LATE submission's
 //    marks still grade in full but its POINTS are halved (rounded down).
+const { notifyOnce } = require('./notify');
 
 // ---------- eligibility ----------
 // Canonical eduStatus values (frontend EDU_STATUS_OPTIONS, 2026-10-23) plus
@@ -219,19 +220,13 @@ async function seedCourseBatch(db) {
   for (const u of users) {
     if (!(await courseEligible(db, u))) continue;
     const nid = `course-b1-launch-${u._id}`;
-    const r = await db.collection('notifications').updateOne(
-      { email: u.email, id: nid },
-      {
-        $setOnInsert: {
-          _id: nid, id: nid, email: u.email, kind: 'course', read: false,
-          date: now,
-          title: '🏛️ ادارہ سازی کورس — بیچ 1: رجسٹریشن کھل گئی ہے',
-          body: 'آپ کی اہلیت کے مطابق یہ خصوصی کورس آپ کے لیے کھلا ہے: ہر پیر رات 8:00 تا 9:30 (پاکستانی وقت)، آغاز پیر 2 نومبر 2026 — ٹرینرز: ڈاکٹر مفتی محمد حسن و محترمہ انعم زیدی صاحبہ۔ رجسٹریشن «ادارہ سازی کورس» والے حصے سے کریں۔',
-        },
-      },
-      { upsert: true }
-    );
-    if (r.upsertedCount) notified += 1;
+    const sent = await notifyOnce(db, {
+      id: nid, email: u.email, kind: 'course', read: false,
+      date: now,
+      title: '🏛️ ادارہ سازی کورس — بیچ 1: رجسٹریشن کھل گئی ہے',
+      body: 'آپ کی اہلیت کے مطابق یہ خصوصی کورس آپ کے لیے کھلا ہے: ہر پیر رات 8:00 تا 9:30 (پاکستانی وقت)، آغاز پیر 2 نومبر 2026 — ٹرینرز: ڈاکٹر مفتی محمد حسن و محترمہ انعم زیدی صاحبہ۔ رجسٹریشن «ادارہ سازی کورس» والے حصے سے کریں۔',
+    });
+    if (sent) notified += 1;
   }
   const gaps = planGaps();
   for (const g of gaps) console.log('course seed gap:', g);
@@ -266,18 +261,12 @@ async function runCourseReleases(db, nowMs) {
     created.push(item.id);
     for (const u of registered) {
       const nid = `asg-new-${item.id}-${u.email}`;
-      await db.collection('notifications').updateOne(
-        { email: u.email, id: nid },
-        {
-          $setOnInsert: {
-            _id: nid, id: nid, email: u.email, kind: 'assignment', read: false,
-            date: new Date().toISOString(),
-            title: '✍️ نئی مشق — ادارہ سازی کورس',
-            body: `${item.title} — «اسائنمنٹس» والے حصے میں کھول کر مکمل کریں۔`,
-          },
-        },
-        { upsert: true }
-      );
+      await notifyOnce(db, {
+        id: nid, email: u.email, kind: 'assignment', read: false,
+        date: new Date().toISOString(),
+        title: '✍️ نئی مشق — ادارہ سازی کورس',
+        body: `${item.title} — «اسائنمنٹس» والے حصے میں کھول کر مکمل کریں۔`,
+      });
     }
   }
   if (created.length) console.log('course releases created:', created.join(', '));

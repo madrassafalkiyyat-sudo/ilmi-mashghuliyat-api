@@ -18,8 +18,12 @@ async function main() {
   // no-ops; Render's free-tier sleep can only delay a release to the same
   // day, and the boot run catches up immediately on wake.
   const course = require('./lib/course');
+  const { backfillNotifications } = require('./lib/notify');
   const tick = async () => {
     try {
+      // Before the seed: older notifications get createdAt + their
+      // exactly-once marker, so expiry can never trigger a re-send.
+      await backfillNotifications(db);
       await course.seedCourseBatch(db);
       await course.runCourseReleases(db);
     } catch (e) {

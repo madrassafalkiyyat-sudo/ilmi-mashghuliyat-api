@@ -4,6 +4,7 @@
 // module warm; see OPEN-DECISIONS.md for host notes).
 const { MongoClient } = require('mongodb');
 const config = require('./config');
+const { ensureNotificationIndexes } = require('./lib/notify');
 
 let client = null;
 let db = null;
@@ -25,8 +26,8 @@ async function ensureIndexes(db) {
   // /auth/refresh and /auth/logout look sessions up by token hash.
   await db.collection('users').createIndex({ 'refreshTokens.hash': 1 });
   await db.collection('admins').createIndex({ 'refreshTokens.hash': 1 });
-  // Own notifications, newest first (polled every minute per student).
-  await db.collection('notifications').createIndex({ email: 1, date: -1 });
+  // Own notifications newest first + automatic expiry (see lib/notify).
+  await ensureNotificationIndexes(db);
   // Exactly-once notifications: one document per (user, notification id).
   await db.collection('notifications').createIndex({ email: 1, id: 1 }, { unique: true, sparse: true });
   // One attendance claim per student per session.
