@@ -8,18 +8,25 @@ const { requireAuth, requireApproved, fail } = require('../middleware/auth');
 const { profileMissing } = require('../lib/rules');
 const { applyVisionReview } = require('../lib/vision');
 const { hashPassword } = require('../auth');
+const { stripSecrets, isLite, isDataUri, signature, slimUserPhoto } = require('../lib/slim');
 
 const router = express.Router();
 router.use(requireAuth);
 
 // GET /api/users/me — own record (the old onSnapshot(users/uid) listener).
+// ?lite=1 swaps the embedded photo for profile.photoSig (see lib/slim);
+// profileMissing is always computed on the full record.
 router.get('/me', async (req, res) => {
-  const u = { ...req.user };
-  delete u.passwordHash;
-  delete u.refreshTokens;
-  delete u.resetTokenHash;
-  delete u.loginTokenHash;
-  return res.json({ user: u, profileMissing: profileMissing(u), isAdmin: req.isAdmin });
+  const u = stripSecrets(req.user);
+  const missing = profileMissing(u);
+  return res.json({ user: isLite(req) ? slimUserPhoto(u) : u, profileMissing: missing, isAdmin: req.isAdmin });
+});
+
+// GET /api/users/me/photo — own photo, fetched by lite clients only when
+// profile.photoSig changes.
+router.get('/me/photo', async (req, res) => {
+  const photo = (req.user.profile && req.user.profile.photo) || '';
+  return res.json({ photo, photoSig: isDataUri(photo) ? signature(photo) : '' });
 });
 
 // PATCH /api/users/me/profile — own profile only. Accepts BOTH shapes the
@@ -35,7 +42,7 @@ router.patch('/me/profile', async (req, res) => {
   const set = {};
   if (profile && typeof profile === 'object') {
     for (const [k, v] of Object.entries(profile)) {
-      if (['status', 'role', 'email', 'uid', '_id', 'passwordHash'].includes(k)) continue;
+      if (['status', 'role', 'email', 'uid', '_id', 'passwordHash', 'photoSig'].includes(k)) continue;
       set[`profile.${k}`] = v;
     }
   }
@@ -45,7 +52,7 @@ router.patch('/me/profile', async (req, res) => {
   if (Object.keys(set).length === 0) return fail(res, 400, 'bad_request', 'پروفائل ڈیٹا درکار ہے');
   const db = await getDb();
   await db.collection('users').updateOne({ _id: req.user._id }, { $set: set });
-  const fresh = await db.collection('users').findOne({ _id: req.user._id });
+  const fresh = stripSecrets(await db.collection('users').findOne({ _id: req.user._id }));
   return res.json({ user: fresh, profileMissing: profileMissing(fresh) });
 });
 

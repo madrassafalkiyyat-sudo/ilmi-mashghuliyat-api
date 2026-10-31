@@ -22,6 +22,11 @@ async function ensureIndexes(db) {
   await db.collection('users').createIndex({ email: 1 }, { unique: true });
   await db.collection('users').createIndex({ uid: 1 }, { unique: true, sparse: true });
   await db.collection('admins').createIndex({ _id: 1 });
+  // /auth/refresh and /auth/logout look sessions up by token hash.
+  await db.collection('users').createIndex({ 'refreshTokens.hash': 1 });
+  await db.collection('admins').createIndex({ 'refreshTokens.hash': 1 });
+  // Own notifications, newest first (polled every minute per student).
+  await db.collection('notifications').createIndex({ email: 1, date: -1 });
   // Exactly-once notifications: one document per (user, notification id).
   await db.collection('notifications').createIndex({ email: 1, id: 1 }, { unique: true, sparse: true });
   // One attendance claim per student per session.

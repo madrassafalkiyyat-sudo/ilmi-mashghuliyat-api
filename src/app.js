@@ -3,6 +3,7 @@
 // imported by tests without opening a port.
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const config = require('./config');
 const { fail } = require('./middleware/auth');
@@ -13,6 +14,14 @@ const app = express();
 // Credentials are NOT used (Bearer tokens instead), so a reflected origin
 // can never turn this API into a confused deputy.
 app.use(cors({ origin: config.corsOrigin, methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'] }));
+app.use(compression());
+// Polled GETs: the browser must revalidate every time (no stale data), and
+// Express's ETag turns an unchanged feed into an empty 304. `private`
+// keeps per-user responses out of shared caches.
+app.use('/api', (req, res, next) => {
+  if (req.method === 'GET') res.set('Cache-Control', 'private, no-cache');
+  next();
+});
 // 10MB JSON limit: base64 photos/documents are ~650KB after client
 // compression; 10MB leaves headroom without inviting abuse.
 app.use(express.json({ limit: '10mb' }));

@@ -20,13 +20,21 @@ function publicUser(u) {
   return { uid: u._id, email: u.email, name: u.name, status: u.status || 'pending', role: u.role || 'student' };
 }
 
+// Newest N refresh tokens are kept per account (one per signed-in device);
+// with a 10-year lifetime they would otherwise accumulate forever.
+const MAX_REFRESH_TOKENS = 10;
+
+function pushRefresh(refresh, expires) {
+  return { $push: { refreshTokens: {
+    $each: [{ hash: hashToken(refresh), expiresAt: expires.toISOString() }],
+    $slice: -MAX_REFRESH_TOKENS,
+  } } };
+}
+
 async function issueSession(db, user, res, extra) {
   const refresh = newRefreshToken();
   const expires = new Date(Date.now() + config.refreshExpiresDays * 86400000);
-  await db.collection('users').updateOne(
-    { _id: user._id },
-    { $push: { refreshTokens: { hash: hashToken(refresh), expiresAt: expires.toISOString() } } }
-  );
+  await db.collection('users').updateOne({ _id: user._id }, pushRefresh(refresh, expires));
   return res.json({ accessToken: signAccessToken(user), refreshToken: refresh, user: publicUser(user), ...(extra || {}) });
 }
 
@@ -44,10 +52,7 @@ async function issueAdminOnlySession(db, adminDoc, res) {
   const user = syntheticAdminUser(adminDoc);
   const refresh = newRefreshToken();
   const expires = new Date(Date.now() + config.refreshExpiresDays * 86400000);
-  await db.collection('admins').updateOne(
-    { _id: user.email },
-    { $push: { refreshTokens: { hash: hashToken(refresh), expiresAt: expires.toISOString() } } }
-  );
+  await db.collection('admins').updateOne({ _id: user.email }, pushRefresh(refresh, expires));
   return res.json({ accessToken: signAccessToken(user), refreshToken: refresh, user: publicUser(user), isAdmin: true });
 }
 

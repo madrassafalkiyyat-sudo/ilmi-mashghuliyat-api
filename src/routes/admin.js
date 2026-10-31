@@ -7,6 +7,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, fail } = require('../middleware/auth');
 const { scoreVision } = require('../lib/rules');
+const { stripSecrets, isLite, isDataUri, signature, slimUserPhoto, slimSessionPoster } = require('../lib/slim');
 
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
@@ -31,7 +32,27 @@ router.get('/users', async (req, res) => {
     const order = { pending: 0, approved: 1, rejected: 2 };
     docs.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
   }
-  return res.json({ docs, nextCursor: docs.length ? docs[docs.length - 1]._id : null });
+  const nextCursor = docs.length ? docs[docs.length - 1]._id : null;
+  const lite = isLite(req);
+  const out = docs.map((d) => (lite ? slimUserPhoto(stripSecrets(d)) : stripSecrets(d)));
+  return res.json({ docs: out, nextCursor });
+});
+
+// GET /api/admin/users/photos?ids=a,b,c — full photos for the users whose
+// photoSig (from ?lite=1) the client has not cached yet. At most 50 ids.
+router.get('/users/photos', async (req, res) => {
+  const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!ids.length) return fail(res, 400, 'missing_fields', 'شناخت درکار ہے');
+  if (ids.length > 50) return fail(res, 400, 'too_many', 'ایک وقت میں زیادہ سے زیادہ 50');
+  const db = await getDb();
+  const docs = await db.collection('users')
+    .find({ _id: { $in: ids } }, { projection: { 'profile.photo': 1 } }).toArray();
+  const photos = {};
+  for (const d of docs) {
+    const photo = (d.profile && d.profile.photo) || '';
+    photos[d._id] = { photo, photoSig: isDataUri(photo) ? signature(photo) : '' };
+  }
+  return res.json({ photos });
 });
 
 // GET /api/admin/users/search?q= — by name or WhatsApp number (normalised:
@@ -47,7 +68,7 @@ router.get('/users/search', async (req, res) => {
       { 'profile.whatsapp': { $regex: digits, $options: 'i' } },
     ],
   }).limit(50).toArray();
-  return res.json({ docs });
+  return res.json({ docs: docs.map(stripSecrets) });
 });
 
 // POST /api/admin/users/:id/approve|reject|incomplete — the three admin
@@ -178,7 +199,7 @@ router.post('/vision-review', async (req, res) => {
 router.get('/settings/session', async (req, res) => {
   const db = await getDb();
   const doc = await db.collection('settings').findOne({ _id: 'session' });
-  return res.json({ session: doc || null });
+  return res.json({ session: (isLite(req) ? slimSessionPoster(doc) : doc) || null });
 });
 
 // GET /api/admin/migration — migration overview for the admin (counts
@@ -277,8 +298,10 @@ router.put('/settings/session', async (req, res) => {
   const db = await getDb();
   const data = req.body && req.body.session;
   if (!data || typeof data !== 'object') return fail(res, 400, 'bad_request', 'سیشن ڈیٹا درکار ہے');
+  // posterSig is a lite-mode response field, never stored.
+  const { posterSig, _id, ...session } = data;
   await db.collection('settings').updateOne(
-    { _id: 'session' }, { $set: data }, { upsert: true }
+    { _id: 'session' }, { $set: session }, { upsert: true }
   );
   return res.json({ ok: true });
 });

@@ -8,6 +8,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, requireApproved, fail } = require('../middleware/auth');
 const { attendanceWindow } = require('../lib/rules');
+const { isLite, isDataUri, signature, slimSessionPoster } = require('../lib/slim');
 
 const router = express.Router();
 router.use(requireAuth, requireApproved);
@@ -30,8 +31,17 @@ router.get('/sessions', async (req, res) => {
   const db = await getDb();
   const docs = await db.collection('courseSessions').find({}).sort({ sessionDate: 1 }).toArray();
   const safe = docs.map(({ ...d }) => d);
-  const live = await db.collection('settings').findOne({ _id: 'session' });
-  return res.json({ sessions: safe, liveSession: sanitiseLiveSession(live) });
+  const live = sanitiseLiveSession(await db.collection('settings').findOne({ _id: 'session' }));
+  return res.json({ sessions: safe, liveSession: isLite(req) ? slimSessionPoster(live) : live });
+});
+
+// GET /api/attendance/session-poster — the live session's poster alone,
+// fetched by lite clients only when posterSig changes.
+router.get('/session-poster', async (req, res) => {
+  const db = await getDb();
+  const live = await db.collection('settings').findOne({ _id: 'session' }, { projection: { poster: 1 } });
+  const poster = (live && live.poster) || '';
+  return res.json({ poster, posterSig: isDataUri(poster) ? signature(poster) : '' });
 });
 
 // GET /api/attendance/mine — own claims + own session registrations.
