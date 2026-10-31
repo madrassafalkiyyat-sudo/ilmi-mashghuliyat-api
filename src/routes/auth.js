@@ -12,9 +12,10 @@ const { hashPassword, checkPassword, signAccessToken, hashToken, newRefreshToken
 const { fail } = require('../middleware/auth');
 const { applyVisionReview } = require('../lib/vision');
 const config = require('../config');
+const { EMAIL_RE, isSafeText } = require('../lib/validate');
 
 const router = express.Router();
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const UNSAFE_TEXT_MSG = 'نام اور دیگر خانوں میں < > " ` جیسے نشانات نہ لکھیں';
 
 function publicUser(u) {
   return { uid: u._id, email: u.email, name: u.name, status: u.status || 'pending', role: u.role || 'student' };
@@ -73,8 +74,11 @@ async function issueAdminOnlySession(db, adminDoc, res) {
 router.post('/register', async (req, res) => {
   const body = req.body || {};
   const { email, password } = body;
-  if (!email || !EMAIL_RE.test(email)) return fail(res, 400, 'bad_email', 'درست ای میل لکھیں');
-  if (!password || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
+  if (typeof email !== 'string' || !EMAIL_RE.test(email)) return fail(res, 400, 'bad_email', 'درست ای میل لکھیں');
+  if (typeof password !== 'string' || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
+  for (const k of ['name', 'mobile', 'degree', 'dept', 'madrasa', 'uni', 'country', 'admissionRoute']) {
+    if (typeof body[k] === 'string' && !isSafeText(body[k])) return fail(res, 400, 'unsafe_text', UNSAFE_TEXT_MSG);
+  }
   try {
     const db = await getDb();
     const norm = String(email).toLowerCase();
@@ -110,6 +114,7 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return fail(res, 400, 'missing_fields', 'ای میل اور پاس ورڈ درکار ہیں');
+  if (typeof email !== 'string' || typeof password !== 'string') return fail(res, 401, 'bad_credentials', 'ای میل یا پاس ورڈ غلط ہے');
   const db = await getDb();
   const user = await db.collection('users').findOne({ email: String(email).toLowerCase() });
   if (!user) return fail(res, 401, 'bad_credentials', 'ای میل یا پاس ورڈ غلط ہے');
@@ -225,8 +230,11 @@ router.post('/student-login', studentLoginLimiter, async (req, res) => {
 //     (unique index normally prevents this; the branch is defensive).
 router.post('/re-register', async (req, res) => {
   const { email, password, name } = req.body || {};
-  if (!email || !EMAIL_RE.test(email)) return fail(res, 400, 'bad_email', 'درست ای میل لکھیں');
-  if (!password || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
+  if (typeof email !== 'string' || !EMAIL_RE.test(email)) return fail(res, 400, 'bad_email', 'درست ای میل لکھیں');
+  if (typeof password !== 'string' || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
+  if (name !== undefined && (typeof name !== 'string' || name.length > 120 || !isSafeText(name))) {
+    return fail(res, 400, 'unsafe_text', UNSAFE_TEXT_MSG);
+  }
   try {
     const db = await getDb();
     const norm = String(email).toLowerCase();
@@ -319,6 +327,7 @@ async function rotateRefresh(db, collName, doc, hash) {
 router.post('/refresh', async (req, res) => {
   const { refreshToken } = req.body || {};
   if (!refreshToken) return fail(res, 400, 'missing_fields', 'ری فریش ٹوکن درکار ہے');
+  if (typeof refreshToken !== 'string') return fail(res, 401, 'bad_token', 'ری فریش ٹوکن غلط ہے');
   const db = await getDb();
   const hash = hashToken(refreshToken);
   const user = await db.collection('users').findOne({ 'refreshTokens.hash': hash });
@@ -340,7 +349,7 @@ router.post('/refresh', async (req, res) => {
 
 router.post('/logout', async (req, res) => {
   const { refreshToken } = req.body || {};
-  if (refreshToken) {
+  if (typeof refreshToken === 'string' && refreshToken) {
     const db = await getDb();
     const hash = hashToken(refreshToken);
     await db.collection('users').updateMany(

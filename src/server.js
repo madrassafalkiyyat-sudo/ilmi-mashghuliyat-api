@@ -6,6 +6,12 @@ const app = require('./app');
 const config = require('./config');
 const { getDb } = require('./db');
 
+// Last resort: a stray rejection outside the request cycle must not take
+// the whole API down for every student (Node's default is to exit).
+process.on('unhandledRejection', (err) => {
+  console.error('unhandled rejection:', err && err.message);
+});
+
 async function main() {
   const db = await getDb();
   app.listen(config.port, () => {

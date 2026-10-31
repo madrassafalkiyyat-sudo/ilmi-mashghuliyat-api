@@ -9,6 +9,7 @@ const { getDb } = require('../db');
 const { requireAuth, requireAdmin, requireApproved, fail } = require('../middleware/auth');
 const { attendanceWindow } = require('../lib/rules');
 const { isLite, isDataUri, signature, slimSessionPoster } = require('../lib/slim');
+const { isSafeId } = require('../lib/validate');
 
 const router = express.Router();
 router.use(requireAuth, requireApproved);
@@ -89,6 +90,7 @@ router.post('/course-register', async (req, res) => {
 router.post('/register', async (req, res) => {
   const { sessionId } = req.body || {};
   if (!sessionId) return fail(res, 400, 'missing_fields', 'سیشن درکار ہے');
+  if (!isSafeId(sessionId)) return fail(res, 400, 'bad_session', 'سیشن کی شناخت درست نہیں');
   const db = await getDb();
   const session = await db.collection('courseSessions').findOne({ sessionId })
     || await db.collection('settings').findOne({ _id: 'session' });
@@ -108,6 +110,8 @@ router.post('/register', async (req, res) => {
 router.post('/claim', async (req, res) => {
   const { sessionId, code } = req.body || {};
   if (!sessionId || !code) return fail(res, 400, 'missing_fields', 'سیشن اور کوڈ درکار ہیں');
+  if (!isSafeId(sessionId)) return fail(res, 400, 'bad_session', 'سیشن کی شناخت درست نہیں');
+  if (typeof code !== 'string' && typeof code !== 'number') return fail(res, 403, 'bad_code', 'کوڈ غلط ہے');
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
   const session = await db.collection('courseSessions').findOne({ sessionId });

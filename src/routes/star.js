@@ -47,6 +47,9 @@ router.get('/top', async (req, res) => {
 router.post('/recommend', async (req, res) => {
   const { targetEmail, note } = req.body || {};
   if (!targetEmail) return fail(res, 400, 'missing_fields', 'جس کی سفارش ہے اس کی ای میل درکار ہے');
+  if (typeof targetEmail !== 'string' || targetEmail.length > 200 || (note !== undefined && typeof note !== 'string')) {
+    return fail(res, 400, 'bad_request', 'ڈیٹا درست نہیں');
+  }
   const db = await getDb();
   const month = new Date().toISOString().slice(0, 7);
   const id = `${month}:${req.user.email}:${String(targetEmail).toLowerCase()}`;
@@ -55,7 +58,7 @@ router.post('/recommend', async (req, res) => {
     {
       $setOnInsert: {
         _id: id, month, fromEmail: req.user.email, fromName: req.user.name,
-        email: String(targetEmail).toLowerCase(), note: note || '',
+        email: String(targetEmail).toLowerCase(), note: (note || '').slice(0, 1000),
         date: new Date().toISOString(),
       },
     },

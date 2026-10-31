@@ -9,6 +9,7 @@ const { profileMissing } = require('../lib/rules');
 const { applyVisionReview } = require('../lib/vision');
 const { hashPassword } = require('../auth');
 const { stripSecrets, isLite, isDataUri, signature, slimUserPhoto } = require('../lib/slim');
+const { profileSet, topLevelValue, ownDocFields, isSafeId } = require('../lib/validate');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -36,18 +37,25 @@ router.get('/me/photo', async (req, res) => {
 // any password material are NEVER client-settable here; vision goes
 // through /me/vision, registration through /attendance/register.
 const TOP_LEVEL_PROFILE_FIELDS = ['name', 'uni', 'madrasa', 'degree', 'dept', 'mobile', 'country'];
+function badProfileField(res, field, error) {
+  const hint = error === 'unsafe_text' ? ' — اس میں < > " ` جیسے نشانات نہ لکھیں' : '';
+  return fail(res, 400, 'bad_profile', `پروفائل کا خانہ «${field}» درست نہیں${hint}`);
+}
 router.patch('/me/profile', async (req, res) => {
   const body = req.body || {};
   const profile = body.profile;
-  const set = {};
-  if (profile && typeof profile === 'object') {
-    for (const [k, v] of Object.entries(profile)) {
-      if (['status', 'role', 'email', 'uid', '_id', 'passwordHash', 'photoSig'].includes(k)) continue;
-      set[`profile.${k}`] = v;
-    }
+  let set = {};
+  if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+    const r = profileSet(profile);
+    if (r.error === 'bad_photo') return fail(res, 400, 'bad_photo', 'تصویر درست نہیں — JPG/PNG تصویر دوبارہ منتخب کریں');
+    if (r.error) return badProfileField(res, r.field, r.error);
+    set = r.set;
   }
   for (const k of TOP_LEVEL_PROFILE_FIELDS) {
-    if (body[k] !== undefined) set[k] = body[k];
+    if (body[k] === undefined) continue;
+    const r = topLevelValue(body[k]);
+    if (r.error) return badProfileField(res, k, r.error);
+    set[k] = r.value;
   }
   if (Object.keys(set).length === 0) return fail(res, 400, 'bad_request', 'پروفائل ڈیٹا درکار ہے');
   const db = await getDb();
@@ -81,7 +89,7 @@ router.post('/me/vision', async (req, res) => {
 // POST /api/users/me/password — set/change own password (logged-in only).
 router.post('/me/password', async (req, res) => {
   const { password } = req.body || {};
-  if (!password || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
+  if (typeof password !== 'string' || password.length < 8) return fail(res, 400, 'weak_password', 'پاس ورڈ کم از کم 8 حروف کا ہو');
   const db = await getDb();
   await db.collection('users').updateOne(
     { _id: req.user._id }, { $set: { passwordHash: await hashPassword(password) } }
@@ -94,9 +102,12 @@ router.post('/me/password', async (req, res) => {
 router.post('/me/push-token', async (req, res) => {
   const { token } = req.body || {};
   if (!token) return fail(res, 400, 'missing_fields', 'ٹوکن درکار ہے');
+  if (typeof token !== 'string' || token.length > 4096) return fail(res, 400, 'bad_token', 'ٹوکن درست نہیں');
   const db = await getDb();
+  // Newest 10 devices per student; re-registering moves a token to the end.
+  await db.collection('users').updateOne({ _id: req.user._id }, { $pull: { fcmTokens: token } });
   await db.collection('users').updateOne(
-    { _id: req.user._id }, { $addToSet: { fcmTokens: token } }
+    { _id: req.user._id }, { $push: { fcmTokens: { $each: [token], $slice: -10 } } }
   );
   return res.json({ ok: true, saved: true });
 });
@@ -147,44 +158,35 @@ router.get('/me/star-requests', requireApproved, async (req, res) => {
 // Own writes (replacing the old persistColl upserts for student-owned
 // collections). The server stamps the JWT email onto every document;
 // students still cannot delete anything (no DELETE route here).
-router.post('/me/drafts', requireApproved, async (req, res) => {
-  const data = req.body && req.body.doc;
-  if (!data || typeof data !== 'object') return fail(res, 400, 'bad_request', 'ڈیٹا درکار ہے');
-  const db = await getDb();
-  const id = data.id || `d${Date.now().toString(36)}`;
-  const doc = { ...data, _id: id, id, email: req.user.email };
-  await db.collection('drafts').updateOne({ _id: id, email: req.user.email }, { $set: doc }, { upsert: true });
-  return res.status(201).json({ doc });
-});
+// Decision fields (status/position/…) belong to the admin: a student's
+// write never sets them, so re-sending a whole doc keeps the admin's
+// verdict, and a new transfer/competition entry always starts pending.
+// An id owned by another student matches no own doc; the insert then
+// collides on _id and is answered 409 by the app's error handler.
+const PENDING = 'زیرِ غور';
+function ownWriteRoute(coll, prefix, opts) {
+  return async (req, res) => {
+    const data = req.body && req.body.doc;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return fail(res, 400, 'bad_request', 'ڈیٹا درکار ہے');
+    if (data.id !== undefined && !isSafeId(data.id)) return fail(res, 400, 'bad_id', 'ریکارڈ کی شناخت درست نہیں');
+    const r = ownDocFields(data);
+    if (r.error === 'too_large') return fail(res, 413, 'too_large', 'ڈیٹا کا سائز حد سے زیادہ ہے');
+    if (r.error) return fail(res, 400, 'bad_request', 'ڈیٹا درست نہیں');
+    const db = await getDb();
+    const id = data.id || `${prefix}${Date.now().toString(36)}`;
+    const set = { ...r.fields, _id: id, id, email: req.user.email };
+    if (opts.stampDate) set.date = new Date().toISOString();
+    const update = { $set: set };
+    if (opts.pendingOnInsert) update.$setOnInsert = { status: PENDING };
+    await db.collection(coll).updateOne({ _id: id, email: req.user.email }, update, { upsert: true });
+    const doc = await db.collection(coll).findOne({ _id: id, email: req.user.email });
+    return res.status(201).json({ doc });
+  };
+}
 
-router.post('/me/transfers', requireApproved, async (req, res) => {
-  const data = req.body && req.body.doc;
-  if (!data || typeof data !== 'object') return fail(res, 400, 'bad_request', 'ڈیٹا درکار ہے');
-  const db = await getDb();
-  const id = data.id || `t${Date.now().toString(36)}`;
-  const doc = { ...data, _id: id, id, email: req.user.email, date: new Date().toISOString() };
-  await db.collection('transfers').updateOne({ _id: id, email: req.user.email }, { $set: doc }, { upsert: true });
-  return res.status(201).json({ doc });
-});
-
-router.post('/me/competitions', requireApproved, async (req, res) => {
-  const data = req.body && req.body.doc;
-  if (!data || typeof data !== 'object') return fail(res, 400, 'bad_request', 'ڈیٹا درکار ہے');
-  const db = await getDb();
-  const id = data.id || `c${Date.now().toString(36)}`;
-  const doc = { ...data, _id: id, id, email: req.user.email, date: new Date().toISOString() };
-  await db.collection('competitions').updateOne({ _id: id, email: req.user.email }, { $set: doc }, { upsert: true });
-  return res.status(201).json({ doc });
-});
-
-router.post('/me/messages', requireApproved, async (req, res) => {
-  const data = req.body && req.body.doc;
-  if (!data || typeof data !== 'object') return fail(res, 400, 'bad_request', 'ڈیٹا درکار ہے');
-  const db = await getDb();
-  const id = data.id || `m${Date.now().toString(36)}`;
-  const doc = { ...data, _id: id, id, email: req.user.email, date: new Date().toISOString() };
-  await db.collection('messages').updateOne({ _id: id, email: req.user.email }, { $set: doc }, { upsert: true });
-  return res.status(201).json({ doc });
-});
+router.post('/me/drafts', requireApproved, ownWriteRoute('drafts', 'd', {}));
+router.post('/me/transfers', requireApproved, ownWriteRoute('transfers', 't', { stampDate: true, pendingOnInsert: true }));
+router.post('/me/competitions', requireApproved, ownWriteRoute('competitions', 'c', { stampDate: true, pendingOnInsert: true }));
+router.post('/me/messages', requireApproved, ownWriteRoute('messages', 'm', { stampDate: true }));
 
 module.exports = router;

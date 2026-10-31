@@ -2,6 +2,7 @@
 // Express app wiring. No listening here (see server.js) so the app can be
 // imported by tests without opening a port.
 const express = require('express');
+require('./lib/asyncErrors');
 const cors = require('cors');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
@@ -9,6 +10,11 @@ const config = require('./config');
 const { fail } = require('./middleware/auth');
 
 const app = express();
+
+// Render terminates TLS at its proxy, so the socket address is the proxy's
+// for every visitor; without this all students share ONE rate-limit
+// bucket. The value is the number of proxy hops in front of the app.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
 
 // CORS: exactly one origin — the institutional GitHub Pages host.
 // Credentials are NOT used (Bearer tokens instead), so a reflected origin
@@ -57,6 +63,10 @@ const authLimiter = rateLimit({
   max: Number(process.env.AUTH_RATE_MAX || 60),
   standardHeaders: true,
   legacyHeaders: false,
+  // Token refresh and logout carry a 384-bit random token — nothing to
+  // guess — and every open tab refreshes hourly; counting them would lock
+  // real students out of the guessable routes.
+  skip: (req) => req.path === '/refresh' || req.path === '/logout',
   handler: (req, res) => fail(res, 429, 'too_many_requests', 'بہت زیادہ کوششیں ہو گئی ہیں — کچھ دیر بعد دوبارہ کوشش کریں'),
 });
 app.use('/api/auth', authLimiter);
@@ -75,7 +85,11 @@ app.use('/api/course', require('./routes/course'));
 // Unknown API route + last-resort error handler (never leak stack traces).
 app.use('/api', (req, res) => fail(res, 404, 'not_found', 'یہ راستہ موجود نہیں'));
 app.use((err, req, res, next) => {
-  console.error('API error:', err && err.message);
+  if (res.headersSent) return next(err);
+  if (err && err.type === 'entity.too.large') return fail(res, 413, 'too_large', 'ڈیٹا کا سائز حد سے زیادہ ہے');
+  if (err && err.type === 'entity.parse.failed') return fail(res, 400, 'bad_json', 'درخواست کا ڈیٹا درست نہیں');
+  if (err && err.code === 11000) return fail(res, 409, 'conflict', 'یہ ریکارڈ پہلے سے موجود ہے');
+  console.error(`API error: ${req.method} ${req.path}:`, err && err.message);
   return fail(res, 500, 'server_error', 'سرور کی خرابی');
 });
 
