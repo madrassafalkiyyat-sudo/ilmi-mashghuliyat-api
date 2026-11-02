@@ -6,12 +6,6 @@ const app = require('./app');
 const config = require('./config');
 const { getDb } = require('./db');
 
-// Last resort: a stray rejection outside the request cycle must not take
-// the whole API down for every student (Node's default is to exit).
-process.on('unhandledRejection', (err) => {
-  console.error('unhandled rejection:', err && err.message);
-});
-
 async function main() {
   const db = await getDb();
   app.listen(config.port, () => {
@@ -24,16 +18,21 @@ async function main() {
   // no-ops; Render's free-tier sleep can only delay a release to the same
   // day, and the boot run catches up immediately on wake.
   const course = require('./lib/course');
-  const { backfillNotifications } = require('./lib/notify');
+  const deadlineAnnounce = require('./lib/deadlineAnnounce');
   const tick = async () => {
     try {
-      // Before the seed: older notifications get createdAt + their
-      // exactly-once marker, so expiry can never trigger a re-send.
-      await backfillNotifications(db);
       await course.seedCourseBatch(db);
       await course.runCourseReleases(db);
     } catch (e) {
       console.error('course tick failed:', e && e.message);
+    }
+    // «⏰ آخری موقع» deadline announcements (Mufti, 2026-11-03): one
+    // effective pass per Karachi date inside this same tick family;
+    // deterministic upserts make repeats no-ops.
+    try {
+      await deadlineAnnounce.runDeadlineAnnouncements(db);
+    } catch (e) {
+      console.error('deadline-announce tick failed:', e && e.message);
     }
   };
   tick();

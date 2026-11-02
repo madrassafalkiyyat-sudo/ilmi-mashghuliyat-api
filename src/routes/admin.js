@@ -7,8 +7,6 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, fail } = require('../middleware/auth');
 const { scoreVision } = require('../lib/rules');
-const { notifyOnce } = require('../lib/notify');
-const { stripSecrets, isLite, isDataUri, signature, slimUserPhoto, slimSessionPoster } = require('../lib/slim');
 
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
@@ -33,27 +31,7 @@ router.get('/users', async (req, res) => {
     const order = { pending: 0, approved: 1, rejected: 2 };
     docs.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
   }
-  const nextCursor = docs.length ? docs[docs.length - 1]._id : null;
-  const lite = isLite(req);
-  const out = docs.map((d) => (lite ? slimUserPhoto(stripSecrets(d)) : stripSecrets(d)));
-  return res.json({ docs: out, nextCursor });
-});
-
-// GET /api/admin/users/photos?ids=a,b,c — full photos for the users whose
-// photoSig (from ?lite=1) the client has not cached yet. At most 50 ids.
-router.get('/users/photos', async (req, res) => {
-  const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
-  if (!ids.length) return fail(res, 400, 'missing_fields', 'شناخت درکار ہے');
-  if (ids.length > 50) return fail(res, 400, 'too_many', 'ایک وقت میں زیادہ سے زیادہ 50');
-  const db = await getDb();
-  const docs = await db.collection('users')
-    .find({ _id: { $in: ids } }, { projection: { 'profile.photo': 1 } }).toArray();
-  const photos = {};
-  for (const d of docs) {
-    const photo = (d.profile && d.profile.photo) || '';
-    photos[d._id] = { photo, photoSig: isDataUri(photo) ? signature(photo) : '' };
-  }
-  return res.json({ photos });
+  return res.json({ docs, nextCursor: docs.length ? docs[docs.length - 1]._id : null });
 });
 
 // GET /api/admin/users/search?q= — by name or WhatsApp number (normalised:
@@ -69,7 +47,7 @@ router.get('/users/search', async (req, res) => {
       { 'profile.whatsapp': { $regex: digits, $options: 'i' } },
     ],
   }).limit(50).toArray();
-  return res.json({ docs: docs.map(stripSecrets) });
+  return res.json({ docs });
 });
 
 // POST /api/admin/users/:id/approve|reject|incomplete — the three admin
@@ -103,11 +81,17 @@ async function decide(req, res, status) {
   await db.collection('users').updateOne({ _id: id }, update);
   // Exactly-once notification for the decision.
   const notifId = `${status}-${id}`;
-  await notifyOnce(db, {
-    id: notifId, email: user.email,
-    title: status === 'approved' ? 'منظوری' : status === 'rejected' ? 'مسترد' : 'نامکمل',
-    body: reason || '', date: new Date().toISOString(), read: false, kind: 'decision',
-  });
+  await db.collection('notifications').updateOne(
+    { email: user.email, id: notifId },
+    {
+      $setOnInsert: {
+        _id: notifId, id: notifId, email: user.email,
+        title: status === 'approved' ? 'منظوری' : status === 'rejected' ? 'مسترد' : 'نامکمل',
+        body: reason || '', date: new Date().toISOString(), read: false, kind: 'decision',
+      },
+    },
+    { upsert: true }
+  );
   // For incomplete the stored status is unchanged (still pending) — report
   // that, not the decision name, so API clients never see a phantom status.
   return res.json({ ok: true, status: status === 'incomplete' ? user.status : status });
@@ -140,11 +124,17 @@ router.post('/notify', async (req, res) => {
   if (!doc.email || !doc.title) return fail(res, 400, 'bad_request', 'ای میل اور عنوان درکار ہیں');
   const db = await getDb();
   const id = doc.id || `n${Date.now().toString(36)}`;
-  await notifyOnce(db, {
-    id, email: doc.email,
-    title: doc.title, body: doc.body || '', kind: doc.kind || 'general',
-    date: doc.date || new Date().toISOString(), read: false,
-  });
+  await db.collection('notifications').updateOne(
+    { email: String(doc.email).toLowerCase(), id },
+    {
+      $setOnInsert: {
+        _id: id, id, email: String(doc.email).toLowerCase(),
+        title: doc.title, body: doc.body || '', kind: doc.kind || 'general',
+        date: doc.date || new Date().toISOString(), read: false,
+      },
+    },
+    { upsert: true }
+  );
   return res.json({ ok: true, id });
 });
 
@@ -188,7 +178,7 @@ router.post('/vision-review', async (req, res) => {
 router.get('/settings/session', async (req, res) => {
   const db = await getDb();
   const doc = await db.collection('settings').findOne({ _id: 'session' });
-  return res.json({ session: (isLite(req) ? slimSessionPoster(doc) : doc) || null });
+  return res.json({ session: doc || null });
 });
 
 // GET /api/admin/migration — migration overview for the admin (counts
@@ -287,12 +277,20 @@ router.put('/settings/session', async (req, res) => {
   const db = await getDb();
   const data = req.body && req.body.session;
   if (!data || typeof data !== 'object') return fail(res, 400, 'bad_request', 'سیشن ڈیٹا درکار ہے');
-  // posterSig is a lite-mode response field, never stored.
-  const { posterSig, _id, ...session } = data;
   await db.collection('settings').updateOne(
-    { _id: 'session' }, { $set: session }, { upsert: true }
+    { _id: 'session' }, { $set: data }, { upsert: true }
   );
   return res.json({ ok: true });
+});
+
+// POST /api/admin/deadline-announcements/run — run the «⏰ آخری موقع»
+// deadline-announcement pass now (the same pass the server tick runs
+// daily; forced here so an admin can refresh on demand). Idempotent.
+router.post('/deadline-announcements/run', async (req, res) => {
+  const db = await getDb();
+  const { runDeadlineAnnouncements } = require('../lib/deadlineAnnounce');
+  const r = await runDeadlineAnnouncements(db, { force: true });
+  return res.json(r);
 });
 
 module.exports = router;
