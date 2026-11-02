@@ -1055,3 +1055,80 @@ test('abstract endpoints: language + theme validation, honest 501 without a Gemi
   const validWrite = await call('/api/help/abstract/write', { method: 'POST', token: t, body: { language: 'en', theme: 'AI in madrasa education' } });
   assert.equal(validWrite.status, 501);
 });
+
+test('achievements: create stamps ts + date-derived month; spotlight sanitized, windowed; admin hide keeps the record', async () => {
+  const tokA = await login('approved-old@example.com', 'newpass123');
+  const tokB = await login('haspass@example.com', 'original123');
+  // A date ~3 months ago (achievement's OWN date governs the month).
+  const nowD = new Date();
+  const oldD = new Date(nowD.getFullYear(), nowD.getMonth() - 3, 15);
+  const oldDate = oldD.getFullYear() + '-' + String(oldD.getMonth() + 1).padStart(2, '0') + '-15';
+  const oldMonth = oldD.getFullYear() + '-' + (oldD.getMonth() + 1);
+  const before = Date.now();
+  const created = await call('/api/users/me/achievements', {
+    method: 'POST', token: tokA,
+    body: { doc: { cat: 'کانفرنس میں شرکت/پریزنٹیشن', title: 'اسپاٹ لائٹ ٹیسٹ کارنامہ', desc: 'ٹیسٹ تفصیل', date: oldDate, evidence: 'proof.pdf', link: '', email: 'spoof@example.com', month: '1999-1', ts: 1 } },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const doc = created.data.doc;
+  assert.equal(doc.email, 'approved-old@example.com', 'email stamped from JWT, never from the client body');
+  assert.equal(doc.month, oldMonth, 'stored month derived from the achievement date, not submission month');
+  assert.ok(typeof doc.ts === 'number' && doc.ts >= before && doc.ts <= Date.now(), 'server-stamped precise ts');
+  assert.equal(doc.spotlightHidden, false);
+  assert.equal(doc.none, false);
+  // Future date rejected; missing evidence rejected.
+  const fut = new Date(Date.now() + 5 * 24 * 3600 * 1000);
+  const futDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi' }).format(fut);
+  const badFuture = await call('/api/users/me/achievements', {
+    method: 'POST', token: tokA,
+    body: { doc: { cat: 'کورس تکمیل', title: 'مستقبل', desc: 'x', date: futDate, evidence: 'a.pdf', link: '' } },
+  });
+  assert.equal(badFuture.status, 400);
+  assert.equal(badFuture.data.error.code, 'future_date');
+  const noEv = await call('/api/users/me/achievements', {
+    method: 'POST', token: tokA,
+    body: { doc: { cat: 'کورس تکمیل', title: 'بے ثبوت', desc: 'x', date: oldDate, evidence: '', link: '' } },
+  });
+  assert.equal(noEv.status, 400);
+  assert.equal(noEv.data.error.code, 'missing_evidence');
+  // Own list contains exactly the one created record.
+  const mine = await call('/api/users/me/achievements', { token: tokA });
+  assert.equal(mine.status, 200);
+  assert.equal(mine.data.docs.filter((x) => x.id === doc.id).length, 1);
+  // Spotlight: a SECOND student sees it — sanitized projection only.
+  const spot = await call('/api/users/achievements/spotlight', { token: tokB });
+  assert.equal(spot.status, 200);
+  const s = spot.data.docs.find((x) => x.id === doc.id);
+  assert.ok(s, 'new achievement appears in another student\'s spotlight');
+  assert.equal(s.title, 'اسپاٹ لائٹ ٹیسٹ کارنامہ');
+  assert.equal(s.date, oldDate);
+  for (const k of ['email', 'evidence', 'link', 'desc']) assert.equal(s[k], undefined, 'spotlight must not leak ' + k);
+  // Admin list carries the full record (evidence intact).
+  const admTok = await login('admin@example.com', 'adminpass123');
+  const lst = await call('/api/admin/lists/achievements?limit=200', { token: admTok });
+  assert.equal(lst.status, 200);
+  const full = lst.data.docs.find((x) => x.id === doc.id);
+  assert.ok(full, 'admin list includes the achievement');
+  assert.equal(full.evidence, 'proof.pdf');
+  // Admin hide: gone from the spotlight, record intact everywhere else.
+  const hide = await call('/api/admin/achievements/' + doc.id + '/spotlight-visibility', { method: 'POST', token: admTok, body: { hidden: true } });
+  assert.equal(hide.status, 200);
+  assert.equal(hide.data.spotlightHidden, true);
+  const spot2 = await call('/api/users/achievements/spotlight', { token: tokB });
+  assert.ok(!spot2.data.docs.some((x) => x.id === doc.id), 'hidden entry leaves the spotlight');
+  const mine2 = await call('/api/users/me/achievements', { token: tokA });
+  assert.ok(mine2.data.docs.some((x) => x.id === doc.id && x.spotlightHidden === true), 'record intact in the owner list');
+  const lst2 = await call('/api/admin/lists/achievements?limit=200', { token: admTok });
+  assert.ok(lst2.data.docs.some((x) => x.id === doc.id), 'record intact in the admin list');
+  // Students cannot use the admin visibility route.
+  const stuHide = await call('/api/admin/achievements/' + doc.id + '/spotlight-visibility', { method: 'POST', token: tokA, body: { hidden: false } });
+  assert.equal(stuHide.status, 403);
+  // Window: backdate ts beyond 6h directly in DB -> spotlight drops it,
+  // own list keeps it.
+  const d = await db();
+  await d.collection('achievements').updateOne({ _id: doc.id }, { $set: { ts: Date.now() - 7 * 3600 * 1000, spotlightHidden: false } });
+  const spot3 = await call('/api/users/achievements/spotlight', { token: tokB });
+  assert.ok(!spot3.data.docs.some((x) => x.id === doc.id), 'expired (>6h) entry leaves the spotlight');
+  const mine3 = await call('/api/users/me/achievements', { token: tokA });
+  assert.ok(mine3.data.docs.some((x) => x.id === doc.id), 'expired entry stays in the owner record');
+});

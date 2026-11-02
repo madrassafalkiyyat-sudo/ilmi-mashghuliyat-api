@@ -206,7 +206,21 @@ router.get('/migration', async (req, res) => {
 // Admin list views (FRONTEND-MAP §5): read-only lists for collections the
 // admin console needs beyond /content. sessionSecrets is deliberately
 // NOT here — it has its own route below so the code path is explicit.
-const ADMIN_LISTABLE = ['sessionArchive', 'counselLogs', 'messages', 'sessionAttendees', 'competitions', 'transfers', 'starRequests', 'courseSessions', 'courses', 'starTeam', 'certificates', 'mailQueue', 'starRecommendations', 'attendanceClaims', 'dashboardData'];
+const ADMIN_LISTABLE = ['sessionArchive', 'counselLogs', 'messages', 'sessionAttendees', 'competitions', 'transfers', 'starRequests', 'courseSessions', 'courses', 'starTeam', 'certificates', 'mailQueue', 'starRecommendations', 'attendanceClaims', 'dashboardData', 'achievements'];
+
+// POST /api/admin/achievements/:id/spotlight-visibility — the admin's
+// «چھپائیں» control on the automatic home spotlight (Mufti, 2026-11-03):
+// flips ONLY the spotlightHidden flag; the achievement record itself
+// stays untouched in the student's record and every admin view.
+router.post('/achievements/:id/spotlight-visibility', async (req, res) => {
+  const hidden = !!(req.body && req.body.hidden);
+  const db = await getDb();
+  const r = await db.collection('achievements').updateOne(
+    { _id: req.params.id }, { $set: { spotlightHidden: hidden } }
+  );
+  if (!r.matchedCount) return fail(res, 404, 'not_found', 'کارگذاری نہیں ملی');
+  return res.json({ ok: true, spotlightHidden: hidden });
+});
 router.get('/lists/:collection', async (req, res) => {
   const coll = req.params.collection;
   if (!ADMIN_LISTABLE.includes(coll)) return fail(res, 404, 'not_found', 'یہ مجموعہ موجود نہیں');
