@@ -151,10 +151,23 @@ function karachiNowMs() {
   return Date.parse(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}Z`);
 }
 
-function attendanceWindow(session) {
+function attendanceWindow(session, nowMs) {
   const d = (session && session.sessionDate) || '';
   if (!d) return { open: true, msg: '' };
-  const now = karachiNowMs();
+  const now = (typeof nowMs === 'number') ? nowMs : karachiNowMs();
+  // Course sessions (Idara Sazi batch classes) — Mufti's fixed rule
+  // (2026-11-03): the claim window is EXACTLY [20:00, 22:00) Asia/Karachi
+  // wall clock for every course session, whatever start/end the session
+  // doc carries, so neither a stored time nor a device timezone can move
+  // it. (The generic path below keeps its stored times + 30-minute grace
+  // for one-off live sessions.)
+  if (session.courseBatch || session.isCourseSession) {
+    const cStart = Date.parse(`${d}T20:00:00Z`);
+    const cEnd = Date.parse(`${d}T22:00:00Z`);
+    if (now < cStart) return { open: false, msg: 'حاضری کا وقت ابھی شروع نہیں ہوا' };
+    if (now >= cEnd) return { open: false, msg: 'حاضری کا وقت ختم ہو چکا ہے' };
+    return { open: true, msg: '' };
+  }
   const start = session.startTime
     ? Date.parse(`${d}T${session.startTime}:00Z`)
     : Date.parse(`${d}T00:00:00Z`);

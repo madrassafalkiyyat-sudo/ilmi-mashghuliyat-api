@@ -11,7 +11,6 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, requireApproved, fail } = require('../middleware/auth');
 const course = require('../lib/course');
-const { notifyOnce } = require('../lib/notify');
 
 const router = express.Router();
 router.use(requireAuth, requireApproved);
@@ -158,12 +157,18 @@ router.post('/admin/grade', async (req, res) => {
   );
   const points = await course.recomputeCoursePoints(db, sub.email);
   const nid = `asg-grade-${submissionId}-${m}`;
-  await notifyOnce(db, {
-    id: nid, email: sub.email, kind: 'grade', read: false,
-    date: new Date().toISOString(),
-    title: '🏅 مشق کے نمبر لگ گئے — ادارہ سازی کورس',
-    body: `«${(asg && asg.title) || 'مشق'}» میں آپ کو ${m}${max ? '/' + max : ''} نمبر ملے۔${sub.late ? ' (تاخیر سے جمع — پوائنٹس نصف شمار ہوئے)' : ''} تفصیل «اسائنمنٹس» میں دیکھیں۔`,
-  });
+  await db.collection('notifications').updateOne(
+    { email: sub.email, id: nid },
+    {
+      $setOnInsert: {
+        _id: nid, id: nid, email: sub.email, kind: 'grade', read: false,
+        date: new Date().toISOString(),
+        title: '🏅 مشق کے نمبر لگ گئے — ادارہ سازی کورس',
+        body: `«${(asg && asg.title) || 'مشق'}» میں آپ کو ${m}${max ? '/' + max : ''} نمبر ملے۔${sub.late ? ' (تاخیر سے جمع — پوائنٹس نصف شمار ہوئے)' : ''} تفصیل «اسائنمنٹس» میں دیکھیں۔`,
+      },
+    },
+    { upsert: true }
+  );
   return res.json({ ok: true, marks: m, points });
 });
 
@@ -197,6 +202,110 @@ router.get('/admin/gradebook', async (req, res) => {
     assignments: assignments.map((a) => ({ id: a.id, title: a.title, maxMarks: a.maxMarks })),
     rows,
   });
+});
+
+// GET /api/course/admin/attendance/:sessionId — per-session attendance
+// for the admin classroom: verified present (with source: code/manual),
+// code claims still awaiting verification, and the absent list
+// (registered students with no claim at all for this session).
+router.get('/admin/attendance/:sessionId', async (req, res) => {
+  const db = await getDb();
+  const sid = req.params.sessionId;
+  const session = await db.collection('courseSessions').findOne({ sessionId: sid });
+  if (!session) return fail(res, 404, 'not_found', 'سیشن نہیں ملا');
+  const students = await db.collection('users')
+    .find({ courseReg: true, status: 'approved' }).project({ email: 1, name: 1 }).toArray();
+  const claims = await db.collection('attendanceClaims').find({ sessionId: sid }).toArray();
+  const claimedEmails = new Set(claims.map((c) => c.email));
+  const shape = (c) => ({
+    email: c.email, name: c.name || '', at: c.date || null,
+    source: c.source === 'manual' ? 'manual' : 'code',
+    markedBy: c.markedBy || null, claimId: c._id,
+  });
+  return res.json({
+    session: { sessionId: sid, title: session.title || '', sessionDate: session.sessionDate || '' },
+    present: claims.filter((c) => c.status === 'تصدیق شدہ').map(shape),
+    pending: claims.filter((c) => c.status !== 'تصدیق شدہ' && c.status !== 'مسترد').map(shape),
+    rejected: claims.filter((c) => c.status === 'مسترد').map(shape),
+    absent: students.filter((u) => !claimedEmails.has(u.email))
+      .map((u) => ({ email: u.email, name: u.name || '' })),
+    registered: students.length,
+  });
+});
+
+// POST /api/course/admin/attendance/manual — mark one registered student
+// present for a course session BY HAND (Mufti 2026-11-03: students who
+// could not claim by code in the window must not lose their attendance).
+// Creates EXACTLY what a verified code claim creates — the claim doc,
+// users.sessionAtts/sessionAtt, and the recomputed points (+10) — tagged
+// source:'manual' with the marking admin and the time, so it stays
+// distinguishable from (and never confused with) a code claim.
+router.post('/admin/attendance/manual', async (req, res) => {
+  const { sessionId, userId } = req.body || {};
+  if (!sessionId || !userId) return fail(res, 400, 'missing_fields', 'سیشن اور طالب علم درکار ہیں');
+  const db = await getDb();
+  const session = await db.collection('courseSessions').findOne({ sessionId });
+  if (!session) return fail(res, 404, 'not_found', 'سیشن نہیں ملا');
+  const user = await db.collection('users').findOne({
+    $or: [{ _id: String(userId) }, { email: String(userId).toLowerCase() }],
+  });
+  if (!user) return fail(res, 404, 'not_found', 'طالب علم نہیں ملا');
+  if (!user.courseReg || user.status !== 'approved') {
+    return fail(res, 403, 'not_registered', 'یہ طالب علم کورس رجسٹرڈ نہیں ہے');
+  }
+  const id = `${sessionId}:${user.email}`;
+  const existing = await db.collection('attendanceClaims').findOne({ _id: id });
+  if (existing) {
+    if (existing.status === 'تصدیق شدہ') return fail(res, 409, 'already_present', 'اس طالب علم کی حاضری پہلے سے درج ہے');
+    return fail(res, 409, 'pending_claim', 'اس طالب علم کا کوڈ دعویٰ تصدیق کے منتظر ہے — اس کی تصدیق کریں، دوسرا اندراج نہیں بن سکتا');
+  }
+  const nowIso = new Date().toISOString();
+  try {
+    await db.collection('attendanceClaims').insertOne({
+      _id: id, id, sessionId, email: user.email, name: user.name || '',
+      sessionTitle: session.title || '', code: '***',
+      date: nowIso, status: 'تصدیق شدہ', verifiedAt: nowIso,
+      source: 'manual', markedBy: req.user.email, markedAt: nowIso,
+    });
+  } catch (e) {
+    if (e.code === 11000) return fail(res, 409, 'already_present', 'اس طالب علم کی حاضری پہلے سے درج ہے');
+    throw e;
+  }
+  await db.collection('users').updateOne(
+    { email: user.email },
+    { $set: { [`sessionAtts.${sessionId}`]: true, sessionAtt: true } }
+  );
+  const points = await course.recomputeCoursePoints(db, user.email);
+  return res.json({ ok: true, points });
+});
+
+// POST /api/course/admin/attendance/manual/undo — reverse a MANUAL mark
+// exactly (claim removed, sessionAtts entry removed, points recomputed).
+// Code claims are never touched from here (claim.source must be
+// 'manual'), mirroring that a verified code claim stands on the
+// student's own in-window action. The legacy sessionAtt boolean is left
+// as-is — the verify path never unsets it either.
+router.post('/admin/attendance/manual/undo', async (req, res) => {
+  const { sessionId, userId } = req.body || {};
+  if (!sessionId || !userId) return fail(res, 400, 'missing_fields', 'سیشن اور طالب علم درکار ہیں');
+  const db = await getDb();
+  const user = await db.collection('users').findOne({
+    $or: [{ _id: String(userId) }, { email: String(userId).toLowerCase() }],
+  });
+  if (!user) return fail(res, 404, 'not_found', 'طالب علم نہیں ملا');
+  const id = `${sessionId}:${user.email}`;
+  const claim = await db.collection('attendanceClaims').findOne({ _id: id });
+  if (!claim) return fail(res, 404, 'not_found', 'حاضری کا ریکارڈ نہیں ملا');
+  if (claim.source !== 'manual') {
+    return fail(res, 403, 'not_manual', 'یہ حاضری کوڈ سے درج ہوئی تھی — یہاں سے واپس نہیں ہو سکتی');
+  }
+  await db.collection('attendanceClaims').deleteOne({ _id: id });
+  await db.collection('users').updateOne(
+    { email: user.email },
+    { $unset: { [`sessionAtts.${sessionId}`]: '' } }
+  );
+  const points = await course.recomputeCoursePoints(db, user.email);
+  return res.json({ ok: true, points });
 });
 
 // POST /api/course/admin/seed — (re)run the batch-1 seed. Idempotent.

@@ -8,8 +8,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth, requireAdmin, requireApproved, fail } = require('../middleware/auth');
 const { attendanceWindow } = require('../lib/rules');
-const { isLite, isDataUri, signature, slimSessionPoster } = require('../lib/slim');
-const { isSafeId } = require('../lib/validate');
+const courseLib = require('../lib/course');
 
 const router = express.Router();
 router.use(requireAuth, requireApproved);
@@ -32,17 +31,8 @@ router.get('/sessions', async (req, res) => {
   const db = await getDb();
   const docs = await db.collection('courseSessions').find({}).sort({ sessionDate: 1 }).toArray();
   const safe = docs.map(({ ...d }) => d);
-  const live = sanitiseLiveSession(await db.collection('settings').findOne({ _id: 'session' }));
-  return res.json({ sessions: safe, liveSession: isLite(req) ? slimSessionPoster(live) : live });
-});
-
-// GET /api/attendance/session-poster — the live session's poster alone,
-// fetched by lite clients only when posterSig changes.
-router.get('/session-poster', async (req, res) => {
-  const db = await getDb();
-  const live = await db.collection('settings').findOne({ _id: 'session' }, { projection: { poster: 1 } });
-  const poster = (live && live.poster) || '';
-  return res.json({ poster, posterSig: isDataUri(poster) ? signature(poster) : '' });
+  const live = await db.collection('settings').findOne({ _id: 'session' });
+  return res.json({ sessions: safe, liveSession: sanitiseLiveSession(live), courseRegOpen: courseLib.COURSE_REG_OPEN });
 });
 
 // GET /api/attendance/mine — own claims + own session registrations.
@@ -72,7 +62,19 @@ router.get('/mine', async (req, res) => {
 router.post('/course-register', async (req, res) => {
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
-  const courseLib = require('../lib/course');
+  // Registration gate (Mufti 2026-11-03): Batch 1 has started, so NEW
+  // registrations are CLOSED — checked BEFORE eligibility so every
+  // non-registrant gets the same clear answer. Existing registrants are
+  // confirmed idempotently and never disturbed by the gate.
+  if (user && user.courseReg) {
+    if (!user.courseRegAt) {
+      await db.collection('users').updateOne({ _id: req.user._id }, { $set: { courseRegAt: new Date().toISOString() } });
+    }
+    return res.json({ ok: true, courseReg: true });
+  }
+  if (!courseLib.COURSE_REG_OPEN) {
+    return fail(res, 403, 'registration_closed', 'ادارہ سازی کورس کی رجسٹریشن بند ہے — کورس شروع ہو چکا ہے');
+  }
   if (!(await courseLib.courseEligible(db, user))) {
     return fail(res, 403, 'not_eligible', courseLib.ELIGIBILITY_MSG);
   }
@@ -90,7 +92,6 @@ router.post('/course-register', async (req, res) => {
 router.post('/register', async (req, res) => {
   const { sessionId } = req.body || {};
   if (!sessionId) return fail(res, 400, 'missing_fields', 'سیشن درکار ہے');
-  if (!isSafeId(sessionId)) return fail(res, 400, 'bad_session', 'سیشن کی شناخت درست نہیں');
   const db = await getDb();
   const session = await db.collection('courseSessions').findOne({ sessionId })
     || await db.collection('settings').findOne({ _id: 'session' });
@@ -110,8 +111,6 @@ router.post('/register', async (req, res) => {
 router.post('/claim', async (req, res) => {
   const { sessionId, code } = req.body || {};
   if (!sessionId || !code) return fail(res, 400, 'missing_fields', 'سیشن اور کوڈ درکار ہیں');
-  if (!isSafeId(sessionId)) return fail(res, 400, 'bad_session', 'سیشن کی شناخت درست نہیں');
-  if (typeof code !== 'string' && typeof code !== 'number') return fail(res, 403, 'bad_code', 'کوڈ غلط ہے');
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
   const session = await db.collection('courseSessions').findOne({ sessionId });
