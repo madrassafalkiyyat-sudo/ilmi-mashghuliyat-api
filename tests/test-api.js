@@ -493,6 +493,85 @@ test('course assignments: submit, edit before deadline, grade -> points; late po
   assert.ok(gb.data.rows.some((r) => r.email === 'cu-mphil@example.com'));
 });
 
+test('course form claims: claim -> grade (clamp 10) -> gradebook; manual + remove; backfill heal; notice once', async () => {
+  const d = await db();
+  const course = require('../src/lib/course');
+  const adminTok = await login('admin@example.com', 'adminpass123');
+  const tok = await seedCourseUser('cu-form', 'cu-form@example.com', 'ایم فل', 'ایم فل مکمل ہے — فی الحال مزید تعلیم جاری نہیں');
+  // course-register is CLOSED by Mufti's decision, so the fixture sets
+  // courseReg directly (the same state a pre-closure registrant is in).
+  await d.collection('users').updateOne({ email: 'cu-form@example.com' }, { $set: { courseReg: true } });
+  const now = Date.now();
+  const mkForm = (id, deadlineMs) => call('/api/course/admin/assignments', {
+    method: 'POST', token: adminTok,
+    body: { doc: { id, title: 'فارم ٹیسٹ ' + id, instructions: 'x', type: 'google-form', formUrl: 'https://docs.google.com/forms/d/xyz/viewform', session: 1, maxMarks: 10, releaseAtMs: now - 1000, deadlineMs } },
+  });
+  assert.equal((await mkForm('asg-form-1', now + 86400000)).status, 201);
+  // Form claim with an EMPTY body is valid (answers live in the Sheet).
+  const claim = await call('/api/course/assignments/asg-form-1/submit', { method: 'POST', token: tok, body: {} });
+  assert.equal(claim.status, 200, JSON.stringify(claim.data));
+  assert.equal(claim.data.late, false);
+  const doc = await d.collection('assignmentSubmissions').findOne({ _id: 'asg-form-1:cu-form@example.com' });
+  assert.ok(doc, 'claim doc created');
+  assert.equal(doc.formClaim, true);
+  assert.equal(doc.source, 'student');
+  assert.equal(doc.marks, null);
+  // The claim is visible to the student in GET /assignments.
+  const list = await call('/api/course/assignments', { token: tok });
+  assert.ok(list.data.submissions.some((s) => s.assignmentId === 'asg-form-1'), 'claim appears in student list');
+  // Gradebook now includes google-form assignments (type carried).
+  const gb = await call('/api/course/admin/gradebook', { token: adminTok });
+  assert.equal(gb.status, 200);
+  const col = gb.data.assignments.findIndex((a) => a.id === 'asg-form-1');
+  assert.ok(col >= 0, 'gradebook includes the google-form assignment');
+  assert.equal(gb.data.assignments[col].type, 'google-form');
+  const row = gb.data.rows.find((r) => r.email === 'cu-form@example.com');
+  assert.ok(row, 'registered student row present');
+  assert.equal(row.marks[col].submitted, true);
+  // Grading clamps to the form max (10) and the points ledger counts it.
+  const grade = await call('/api/course/admin/grade', { method: 'POST', token: adminTok, body: { submissionId: 'asg-form-1:cu-form@example.com', marks: 14, feedback: 'درست' } });
+  assert.equal(grade.status, 200);
+  assert.equal(grade.data.marks, 10, 'marks clamp to maxMarks 10');
+  assert.equal(grade.data.points.assignmentPoints, 10, 'points include the graded form claim');
+  // A graded record cannot be removed.
+  const rmGraded = await call('/api/course/admin/submissions/remove', { method: 'POST', token: adminTok, body: { submissionId: 'asg-form-1:cu-form@example.com' } });
+  assert.equal(rmGraded.status, 409, 'graded submission removal refused');
+  // Manual entry: creates an ungraded record, duplicate refused, remove works.
+  assert.equal((await mkForm('asg-form-2', now + 86400000)).status, 201);
+  const man = await call('/api/course/admin/submissions/manual', { method: 'POST', token: adminTok, body: { assignmentId: 'asg-form-2', email: 'cu-form@example.com' } });
+  assert.equal(man.status, 201, JSON.stringify(man.data));
+  assert.equal(man.data.doc.source, 'manual');
+  assert.equal(man.data.doc.formClaim, true);
+  assert.equal(man.data.doc.marks, null);
+  const dup = await call('/api/course/admin/submissions/manual', { method: 'POST', token: adminTok, body: { assignmentId: 'asg-form-2', email: 'cu-form@example.com' } });
+  assert.equal(dup.status, 409, 'duplicate manual entry refused');
+  const rm = await call('/api/course/admin/submissions/remove', { method: 'POST', token: adminTok, body: { submissionId: 'asg-form-2:cu-form@example.com' } });
+  assert.equal(rm.status, 200);
+  assert.equal(await d.collection('assignmentSubmissions').countDocuments({ _id: 'asg-form-2:cu-form@example.com' }), 0);
+  // Late flag on a form claim past its deadline.
+  assert.equal((await mkForm('asg-form-late', now - 86400000)).status, 201);
+  const lateClaim = await call('/api/course/assignments/asg-form-late/submit', { method: 'POST', token: tok, body: { text: 'نوٹ' } });
+  assert.equal(lateClaim.status, 200);
+  assert.equal(lateClaim.data.late, true);
+  // Plan values: forms 10, in-app 20.
+  assert.ok(course.releasePlan().filter((p) => p.type === 'google-form').every((p) => p.maxMarks === 10));
+  assert.ok(course.releasePlan().filter((p) => p.type === 'in-app').every((p) => p.maxMarks === 20));
+  // Backfill: an existing plan form assignment stored with maxMarks 0 heals.
+  await d.collection('assignments').insertOne({
+    _id: 'asg-b1-f2-s2', id: 'asg-b1-f2-s2', course: 'idara-b1', auto: true, kind: 'form2',
+    title: 'heal fixture', type: 'google-form', formUrl: 'https://docs.google.com/forms/d/xyz/viewform',
+    releaseAtMs: Date.parse('2026-11-11T09:00:00+05:00'), deadlineMs: Date.parse('2026-11-16T20:00:00+05:00'), maxMarks: 0,
+  });
+  const rr = await course.runCourseReleases(d, Date.parse('2026-11-11T10:00:00+05:00'));
+  assert.ok((rr.healed || []).includes('asg-b1-f2-s2'), 'healed list carries the fixture');
+  assert.equal((await d.collection('assignments').findOne({ _id: 'asg-b1-f2-s2' })).maxMarks, 10);
+  // The form-system notice is exactly-once per registered student.
+  await course.notifyFormSystemOnce(d);
+  const n2 = await course.notifyFormSystemOnce(d);
+  assert.equal(n2.created, 0, 'second notice run creates nothing');
+  assert.equal(await d.collection('notifications').countDocuments({ email: 'cu-form@example.com', id: 'form-system-2026-11-03-cu-form@example.com' }), 1);
+});
+
 test('course attendance: courseReg counts as registration; verified claim adds +10 points', async () => {
   const d = await db();
   const today = karachiToday();

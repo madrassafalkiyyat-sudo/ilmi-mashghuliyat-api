@@ -48,20 +48,26 @@ router.get('/leaderboard', async (req, res) => {
   return res.json({ leaderboard: board });
 });
 
-// POST /api/course/assignments/:id/submit — in-app submission.
-// One doc per (assignment, student). Edit is allowed BEFORE the deadline
-// and only while ungraded; after the deadline a first submission is still
-// accepted but flagged late (points halved at grading — see lib/course).
+// POST /api/course/assignments/:id/submit — in-app submission OR, for a
+// google-form assignment, the student's FORM CLAIM (Mufti 2026-11-03):
+// the answers themselves live in the form's Sheet; here the student
+// declares "I submitted the form" and the admin later grades that claim
+// against the Sheet. One doc per (assignment, student). Edit is allowed
+// BEFORE the deadline and only while ungraded; after the deadline a
+// first submission is still accepted but flagged late (points halved at
+// grading — see lib/course). A form claim's text (an optional note) may
+// be empty — only in-app answers require text/link.
 router.post('/assignments/:id/submit', async (req, res) => {
   const db = await getDb();
   if (!isReg(req)) return fail(res, 403, 'not_registered', 'یہ مشق صرف کورس رجسٹرڈ طلبہ کے لیے ہے');
   const asg = await db.collection('assignments').findOne({ _id: req.params.id });
   if (!asg) return fail(res, 404, 'not_found', 'مشق نہیں ملی');
-  if (asg.type !== 'in-app') return fail(res, 400, 'wrong_type', 'یہ مشق گوگل فارم پر مکمل ہوتی ہے — فارم کا بٹن کھولیں');
+  const isForm = asg.type === 'google-form';
+  if (!isForm && asg.type !== 'in-app') return fail(res, 400, 'wrong_type', 'اس مشق کی قسم درست نہیں');
   if ((asg.releaseAtMs || 0) > Date.now()) return fail(res, 403, 'not_released', 'یہ مشق ابھی جاری نہیں ہوئی');
   const text = String((req.body && req.body.text) || '').trim();
   const link = String((req.body && req.body.link) || '').trim();
-  if (!text && !link) return fail(res, 400, 'empty', 'جواب لکھنا ضروری ہے');
+  if (!isForm && !text && !link) return fail(res, 400, 'empty', 'جواب لکھنا ضروری ہے');
   if (text.length > 20000) return fail(res, 400, 'too_long', 'جواب بہت طویل ہے — 20,000 حروف تک لکھیں');
   if (link && !/^https:\/\//i.test(link)) return fail(res, 400, 'bad_link', 'لنک درست https ربط ہونا چاہیے');
   const id = `${asg._id}:${req.user.email}`;
@@ -82,6 +88,7 @@ router.post('/assignments/:id/submit', async (req, res) => {
   const doc = {
     _id: id, id, assignmentId: asg._id, email: req.user.email, name: req.user.name || '',
     text, link, late, submittedAt: new Date().toISOString(), marks: null, feedback: '',
+    source: 'student', ...(isForm ? { formClaim: true } : {}),
   };
   await db.collection('assignmentSubmissions').updateOne({ _id: id }, { $setOnInsert: doc }, { upsert: true });
   return res.json({ ok: true, late });
@@ -172,6 +179,65 @@ router.post('/admin/grade', async (req, res) => {
   return res.json({ ok: true, marks: m, points });
 });
 
+// POST /api/course/admin/submissions/manual — admin asserts a submission
+// exists OUTSIDE the app (Mufti 2026-11-03: e.g. the student's answers are
+// in the form's Sheet but they never pressed the in-app claim button).
+// Creates an UNGRADED record (source 'manual'); grading then flows
+// through the ordinary grade route. 409 when a record already exists —
+// manual entry never overwrites a student's own claim.
+router.post('/admin/submissions/manual', async (req, res) => {
+  const { assignmentId, email } = req.body || {};
+  if (!assignmentId || !email) return fail(res, 400, 'bad_request', 'مشق اور طالب علم درکار ہیں');
+  const db = await getDb();
+  const asg = await db.collection('assignments').findOne({ _id: String(assignmentId) });
+  if (!asg) return fail(res, 404, 'not_found', 'مشق نہیں ملی');
+  const em = String(email).trim().toLowerCase();
+  const user = await db.collection('users').findOne({ email: em });
+  if (!user) return fail(res, 404, 'not_found', 'طالب علم نہیں ملا');
+  if (!user.courseReg || user.status !== 'approved') {
+    return fail(res, 403, 'not_registered', 'یہ طالب علم کورس رجسٹرڈ نہیں ہے');
+  }
+  const id = `${asg._id}:${em}`;
+  const prev = await db.collection('assignmentSubmissions').findOne({ _id: id });
+  if (prev) return fail(res, 409, 'already_exists', 'اس طالب علم کا اندراج اس مشق میں پہلے سے موجود ہے');
+  const doc = {
+    _id: id, id, assignmentId: asg._id, email: em, name: user.name || '',
+    text: '', link: '', late: Date.now() > (asg.deadlineMs || Infinity),
+    submittedAt: new Date().toISOString(), marks: null, feedback: '',
+    source: 'manual', markedBy: req.user.email,
+    ...(asg.type === 'google-form' ? { formClaim: true } : {}),
+  };
+  try {
+    await db.collection('assignmentSubmissions').insertOne(doc);
+  } catch (e) {
+    if (e.code === 11000) return fail(res, 409, 'already_exists', 'اس طالب علم کا اندراج اس مشق میں پہلے سے موجود ہے');
+    throw e;
+  }
+  return res.status(201).json({ ok: true, doc });
+});
+
+// POST /api/course/admin/submissions/remove — delete an UNGRADED
+// submission record (any source) and recompute the student's points.
+// A GRADED record is the student's permanent grade history: removal is
+// refused (409) — with ONE hard-coded exception: {force:true} may delete
+// a graded record ONLY when it belongs to the known test account
+// (muftihassan2026@gmail.com), so end-to-end test proofs can clean up
+// after themselves without a general delete-graded capability.
+router.post('/admin/submissions/remove', async (req, res) => {
+  const { submissionId, force } = req.body || {};
+  if (!submissionId) return fail(res, 400, 'bad_request', 'اندراج درکار ہے');
+  const db = await getDb();
+  const sub = await db.collection('assignmentSubmissions').findOne({ _id: String(submissionId) });
+  if (!sub) return fail(res, 404, 'not_found', 'اندراج نہیں ملا');
+  if (typeof sub.marks === 'number') {
+    const testCleanup = force === true && sub.email === 'muftihassan2026@gmail.com';
+    if (!testCleanup) return fail(res, 409, 'already_graded', 'اس اندراج کے نمبر لگ چکے ہیں — حذف نہیں ہو سکتا');
+  }
+  await db.collection('assignmentSubmissions').deleteOne({ _id: sub._id });
+  const points = await course.recomputeCoursePoints(db, sub.email);
+  return res.json({ ok: true, points });
+});
+
 // GET /api/course/admin/gradebook — one row per registered student:
 // per-session attendance, per-assignment marks, totals. Attendance is
 // derived by the ONE canonical rule (lib/course.js attStateFor):
@@ -184,7 +250,7 @@ router.get('/admin/gradebook', async (req, res) => {
     .find({ courseReg: true, status: 'approved' }).project({ email: 1, name: 1, courseAtt: 1, sessionAtts: 1 }).toArray();
   const sessions = await db.collection('courseSessions').find({}).sort({ sessionDate: 1 }).toArray();
   const claims = await db.collection('attendanceClaims').find({}).toArray();
-  const assignments = await db.collection('assignments').find({ type: 'in-app' }).sort({ releaseAtMs: 1 }).toArray();
+  const assignments = await db.collection('assignments').find({}).sort({ releaseAtMs: 1 }).toArray();
   const subs = await db.collection('assignmentSubmissions').find({}).toArray();
   const claimBy = {};
   for (const c of claims) claimBy[`${c.email}|${c.sessionId}`] = c;
@@ -209,7 +275,7 @@ router.get('/admin/gradebook', async (req, res) => {
   });
   return res.json({
     sessions: sessions.map((s) => ({ sessionId: s.sessionId, title: s.title, sessionDate: s.sessionDate })),
-    assignments: assignments.map((a) => ({ id: a.id, title: a.title, maxMarks: a.maxMarks })),
+    assignments: assignments.map((a) => ({ id: a.id, title: a.title, maxMarks: a.maxMarks, type: a.type })),
     rows,
   });
 });
@@ -345,7 +411,17 @@ router.post('/admin/seed', async (req, res) => {
 router.post('/admin/releases', async (req, res) => {
   const db = await getDb();
   const r = await course.runCourseReleases(db);
-  return res.json({ ok: true, created: r.created });
+  return res.json({ ok: true, created: r.created, healed: r.healed || [] });
+});
+
+// POST /api/course/admin/notify-form-system — the one-time notice about
+// the google-form marks system (Mufti 2026-11-03). Exactly-once per
+// student by deterministic notification id (see lib/course.js); safe to
+// call again — it then creates nothing.
+router.post('/admin/notify-form-system', async (req, res) => {
+  const db = await getDb();
+  const r = await course.notifyFormSystemOnce(db);
+  return res.json({ ok: true, created: r.created, total: r.total });
 });
 
 module.exports = router;

@@ -139,9 +139,12 @@ function planInstantMs(dateStr, plusDays, hour) {
 // session (Tue 09:00 Karachi), form 2 + the slide activity two days after
 // (Wed 09:00 Karachi). Deadlines: the next session's start (Mon 20:00
 // Karachi); the last session's items close 2027-01-11 20:00 Karachi.
-// Google-Form assignments carry no marks (responses land in the form's own
-// sheet, outside the app — the app cannot see who filled them); in-app
-// activity assignments carry 20 marks by default (admin-editable).
+// Google-Form assignments carry 10 marks (Mufti 2026-11-03): the answers
+// themselves land in the form's own sheet, but the student CLAIMS the
+// submission in-app (formClaim) and the admin grades it against the sheet
+// answers and the class material — so the app holds the claim, the marks
+// and the feedback. In-app activity assignments carry 20 marks by default
+// (admin-editable).
 function releasePlan() {
   const items = [];
   for (const s of BATCH1_SESSIONS) {
@@ -151,13 +154,13 @@ function releasePlan() {
       id: `asg-b1-f1-s${s.n}`, kind: 'form1', session: s.n, type: 'google-form',
       title: `مشق فارم 1 — کلاس ${s.n}: ${s.form1Name || s.title}`,
       instructions: `کلاس ${s.n} (${s.title}) کی پہلی سرگرمی کا گوگل فارم ہے۔ فارم کھول کر تمام سوالات کے جوابات غور سے دیں — آپ کے جوابات براہِ راست انتظامیہ کے ریکارڈ میں جائیں گے۔`,
-      formUrl: s.form1, releaseAtMs: planInstantMs(s.date, 1, 9), deadlineMs: deadline, maxMarks: 0,
+      formUrl: s.form1, releaseAtMs: planInstantMs(s.date, 1, 9), deadlineMs: deadline, maxMarks: 10,
     });
     if (s.form2) items.push({
       id: `asg-b1-f2-s${s.n}`, kind: 'form2', session: s.n, type: 'google-form',
       title: `مشق فارم 2 — کلاس ${s.n}: ${s.form2Name || s.title}`,
       instructions: `کلاس ${s.n} (${s.title}) کی دوسری سرگرمی کا گوگل فارم ہے۔ فارم کھول کر تمام سوالات کے جوابات غور سے دیں — آپ کے جوابات براہِ راست انتظامیہ کے ریکارڈ میں جائیں گے۔`,
-      formUrl: s.form2, releaseAtMs: planInstantMs(s.date, 2, 9), deadlineMs: deadline, maxMarks: 0,
+      formUrl: s.form2, releaseAtMs: planInstantMs(s.date, 2, 9), deadlineMs: deadline, maxMarks: 10,
     });
     if (s.activity) items.push({
       id: `asg-b1-act-s${s.n}`, kind: 'activity', session: s.n, type: 'in-app',
@@ -255,12 +258,27 @@ async function seedCourseBatch(db) {
 async function runCourseReleases(db, nowMs) {
   const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const created = [];
+  const healed = [];
   const registered = await db.collection('users')
     .find({ courseReg: true, status: 'approved' }).project({ email: 1 }).toArray();
   for (const item of releasePlan()) {
     if (item.releaseAtMs > now) continue;
     const existing = await db.collection('assignments').findOne({ _id: item.id });
-    if (existing) continue;
+    if (existing) {
+      // Heal (Mufti 2026-11-03): plan google-form assignments created before
+      // forms carried marks still store maxMarks 0 — lift ONLY that field
+      // to the plan value so grading/clamping works on live assignments.
+      // Titles, times and every other field stay exactly as stored;
+      // assignments whose id is not in the plan are never reached here.
+      if (item.type === 'google-form' && existing.type === 'google-form'
+        && (existing.maxMarks === 0 || existing.maxMarks === undefined || existing.maxMarks === null)) {
+        await db.collection('assignments').updateOne(
+          { _id: item.id }, { $set: { maxMarks: item.maxMarks } }
+        );
+        healed.push(item.id);
+      }
+      continue;
+    }
     const doc = {
       _id: item.id, id: item.id, course: 'idara-b1', auto: true, kind: item.kind,
       title: item.title, instructions: item.instructions, session: item.session,
@@ -289,7 +307,41 @@ async function runCourseReleases(db, nowMs) {
     }
   }
   if (created.length) console.log('course releases created:', created.join(', '));
-  return { created };
+  if (healed.length) console.log('course releases healed (form maxMarks):', healed.join(', '));
+  return { created, healed };
+}
+
+// ---------- one-time notice: the google-form marks system (2026-11-03) ----------
+// Exactly-once by construction: the notification id is deterministic
+// (`form-system-2026-11-03-<email>`) and the write is a $setOnInsert
+// upsert — the same pattern as every other course notification — so
+// calling this any number of times notifies each registered student
+// exactly once, ever.
+const FORM_SYSTEM_NOTICE = {
+  kind: 'assignment',
+  title: '✍️ فارم مشقوں کا نیا نظام — ادارہ سازی کورس',
+  body: 'اب ہر گوگل فارم مشق کے بھی ایپ میں نمبر ملیں گے (کل 10)۔ طریقہ: (۱) فارم کھول کر جوابات جمع کرائیں؛ (۲) واپس ایپ کے «اسائنمنٹس» میں اسی مشق پر «میں نے فارم جمع کرا دیا ہے» دبائیں۔ انتظامیہ فارم شیٹ سے آپ کے جوابات کلاس کے مواد کے مطابق پرکھ کر نمبر دے گی — نمبر اور رائے آپ کو یہیں «میرے نمبرات» میں نظر آئیں گے۔ جو طلبہ کلاس 1 کا فارم بھر چکے ہیں وہ اس کا اندراج بھی ابھی کر لیں۔',
+};
+async function notifyFormSystemOnce(db) {
+  const now = new Date().toISOString();
+  const registered = await db.collection('users')
+    .find({ courseReg: true, status: 'approved' }).project({ email: 1 }).toArray();
+  let created = 0;
+  for (const u of registered) {
+    const nid = `form-system-2026-11-03-${u.email}`;
+    const r = await db.collection('notifications').updateOne(
+      { email: u.email, id: nid },
+      {
+        $setOnInsert: {
+          _id: nid, id: nid, email: u.email, kind: FORM_SYSTEM_NOTICE.kind, read: false,
+          date: now, title: FORM_SYSTEM_NOTICE.title, body: FORM_SYSTEM_NOTICE.body,
+        },
+      },
+      { upsert: true }
+    );
+    if (r.upsertedCount) created += 1;
+  }
+  return { created, total: registered.length };
 }
 
 // ---------- points ledger ----------
@@ -382,6 +434,6 @@ module.exports = {
   MPHIL_DONE, PHD_DONE, ELIGIBILITY_MSG,
   courseEligibleQuick, courseEligible,
   BATCH1_SESSIONS, sessionIdFor, releasePlan, planGaps,
-  seedCourseBatch, runCourseReleases,
+  seedCourseBatch, runCourseReleases, notifyFormSystemOnce, FORM_SYSTEM_NOTICE,
   recomputeCoursePoints, badgesFor, courseLeaderboard, attStateFor,
 };
