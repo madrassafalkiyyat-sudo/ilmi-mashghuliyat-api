@@ -173,29 +173,39 @@ router.post('/admin/grade', async (req, res) => {
 });
 
 // GET /api/course/admin/gradebook — one row per registered student:
-// per-session attendance, per-assignment marks, totals.
+// per-session attendance, per-assignment marks, totals. Attendance is
+// derived by the ONE canonical rule (lib/course.js attStateFor):
+// att[] stays the present booleans, attState[] carries 'code' |
+// 'manual' | 'pending' | '' per session so every surface can show the
+// tick WITH its source and pending claims as their own state.
 router.get('/admin/gradebook', async (req, res) => {
   const db = await getDb();
   const students = await db.collection('users')
-    .find({ courseReg: true, status: 'approved' }).project({ email: 1, name: 1, courseAtt: 1 }).toArray();
+    .find({ courseReg: true, status: 'approved' }).project({ email: 1, name: 1, courseAtt: 1, sessionAtts: 1 }).toArray();
   const sessions = await db.collection('courseSessions').find({}).sort({ sessionDate: 1 }).toArray();
-  const claims = await db.collection('attendanceClaims').find({ status: 'تصدیق شدہ' }).toArray();
+  const claims = await db.collection('attendanceClaims').find({}).toArray();
   const assignments = await db.collection('assignments').find({ type: 'in-app' }).sort({ releaseAtMs: 1 }).toArray();
   const subs = await db.collection('assignmentSubmissions').find({}).toArray();
-  const verified = {};
-  for (const c of claims) { (verified[c.email] = verified[c.email] || new Set()).add(c.sessionId); }
+  const claimBy = {};
+  for (const c of claims) claimBy[`${c.email}|${c.sessionId}`] = c;
   const subBy = {};
   for (const s of subs) subBy[`${s.assignmentId}:${s.email}`] = s;
   const rows = students.map((u) => {
-    const attIds = new Set([...(verified[u.email] || []), ...((u.courseAtt || []))]);
-    const att = sessions.map((s) => attIds.has(s.sessionId));
+    const states = sessions.map((s) => course.attStateFor(u, s.sessionId, claimBy[`${u.email}|${s.sessionId}`]));
+    const att = states.map((x) => x.state === 'present');
+    const attState = states.map((x) => (x.state === 'present' ? x.source : (x.state === 'pending' ? 'pending' : '')));
     const marks = assignments.map((a) => {
       const s = subBy[`${a._id}:${u.email}`];
       if (!s) return null;
       return { marks: s.marks, late: !!s.late, submitted: true };
     });
     const totalMarks = marks.reduce((t, m) => t + (m && typeof m.marks === 'number' ? m.marks : 0), 0);
-    return { email: u.email, name: u.name, att, attCount: att.filter(Boolean).length, marks, totalMarks };
+    return {
+      email: u.email, name: u.name, att, attState,
+      attCount: att.filter(Boolean).length,
+      attPend: attState.filter((x) => x === 'pending').length,
+      marks, totalMarks,
+    };
   });
   return res.json({
     sessions: sessions.map((s) => ({ sessionId: s.sessionId, title: s.title, sessionDate: s.sessionDate })),
@@ -214,21 +224,36 @@ router.get('/admin/attendance/:sessionId', async (req, res) => {
   const session = await db.collection('courseSessions').findOne({ sessionId: sid });
   if (!session) return fail(res, 404, 'not_found', 'سیشن نہیں ملا');
   const students = await db.collection('users')
-    .find({ courseReg: true, status: 'approved' }).project({ email: 1, name: 1 }).toArray();
+    .find({ courseReg: true, status: 'approved' }).project({ email: 1, name: 1, sessionAtts: 1, courseAtt: 1 }).toArray();
   const claims = await db.collection('attendanceClaims').find({ sessionId: sid }).toArray();
-  const claimedEmails = new Set(claims.map((c) => c.email));
+  const claimOf = {};
+  for (const c of claims) claimOf[c.email] = c;
   const shape = (c) => ({
     email: c.email, name: c.name || '', at: c.date || null,
     source: c.source === 'manual' ? 'manual' : 'code',
     markedBy: c.markedBy || null, claimId: c._id,
   });
+  // Same ONE rule as the gradebook (attStateFor): verified claim OR an
+  // admin-entered user-doc record = present; an unverified claim stays
+  // visibly pending; a rejected claim never masquerades as absent.
+  const present = [], pending = [], rejected = [], absent = [];
+  for (const u of students) {
+    const c = claimOf[u.email] || null;
+    const st = course.attStateFor(u, sid, c);
+    if (st.state === 'present') {
+      if (c && c.status === 'تصدیق شدہ') present.push(shape(c));
+      else present.push({ email: u.email, name: u.name || '', at: null, source: 'manual', markedBy: null, claimId: null, legacy: true });
+    } else if (st.state === 'pending') {
+      pending.push(shape(c));
+    } else if (c && c.status === 'مسترد') {
+      rejected.push(shape(c));
+    } else if (!c) {
+      absent.push({ email: u.email, name: u.name || '' });
+    }
+  }
   return res.json({
     session: { sessionId: sid, title: session.title || '', sessionDate: session.sessionDate || '' },
-    present: claims.filter((c) => c.status === 'تصدیق شدہ').map(shape),
-    pending: claims.filter((c) => c.status !== 'تصدیق شدہ' && c.status !== 'مسترد').map(shape),
-    rejected: claims.filter((c) => c.status === 'مسترد').map(shape),
-    absent: students.filter((u) => !claimedEmails.has(u.email))
-      .map((u) => ({ email: u.email, name: u.name || '' })),
+    present, pending, rejected, absent,
     registered: students.length,
   });
 });

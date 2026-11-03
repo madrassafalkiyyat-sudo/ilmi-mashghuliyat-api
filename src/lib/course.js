@@ -307,9 +307,14 @@ async function recomputeCoursePoints(db, email) {
   const claims = await db.collection('attendanceClaims')
     .find({ email: em, status: 'تصدیق شدہ' }).toArray();
   const attended = new Set(claims.filter((c) => courseIds.has(c.sessionId)).map((c) => c.sessionId));
-  // Admin-entered attendance (user.courseAtt) counts for the record too —
-  // the same source the book lock and the attendance sheet use.
+  // Admin-entered attendance counts for the record too — the same union
+  // every surface uses (attStateFor): users.courseAtt (array) AND
+  // users.sessionAtts (per-session map, the form this API writes).
   for (const sid of (user.courseAtt || [])) if (courseIds.has(sid)) attended.add(sid);
+  const attMap = user.sessionAtts || {};
+  if (attMap && typeof attMap === 'object') {
+    for (const [sid, v] of Object.entries(attMap)) if (v && courseIds.has(sid)) attended.add(sid);
+  }
   const attendanceCount = attended.size;
   const attendancePoints = attendanceCount * 10;
   const subs = await db.collection('assignmentSubmissions').find({ email: em }).toArray();
@@ -329,6 +334,29 @@ async function recomputeCoursePoints(db, email) {
   };
   await db.collection('coursePoints').updateOne({ _id: em }, { $set: doc }, { upsert: true });
   return doc;
+}
+
+// ---------- ONE attendance rule for every surface (Mufti 2026-11-03) ----------
+// A student is حاضر for a session iff a VERIFIED claim exists OR an
+// admin-entered record exists on the user doc (users.sessionAtts map /
+// users.courseAtt array — written by the manual-mark endpoint and the
+// legacy admin tool). An unverified code claim is its OWN visible state
+// ('pending' — «تصدیق باقی»), never silently absent and never counted
+// present. The source tag travels with the tick: a verified claim keeps
+// its own tag ('manual' claim doc vs plain code claim); presence that
+// only a user-doc record proves is an admin entry by construction.
+// Every admin surface (attendance section, gradebook, student list/PDF,
+// points) derives from this one function so they can never diverge.
+function attStateFor(user, sid, claim) {
+  if (claim && claim.status === 'تصدیق شدہ') {
+    return { state: 'present', source: claim.source === 'manual' ? 'manual' : 'code' };
+  }
+  const u = user || {};
+  const fromUser = !!((u.sessionAtts && u.sessionAtts[sid])
+    || (Array.isArray(u.courseAtt) && u.courseAtt.includes(sid)));
+  if (fromUser) return { state: 'present', source: 'manual' };
+  if (claim && claim.status !== 'مسترد') return { state: 'pending', source: 'code' };
+  return { state: 'none', source: null };
 }
 
 function badgesFor(points, rank) {
@@ -355,5 +383,5 @@ module.exports = {
   courseEligibleQuick, courseEligible,
   BATCH1_SESSIONS, sessionIdFor, releasePlan, planGaps,
   seedCourseBatch, runCourseReleases,
-  recomputeCoursePoints, badgesFor, courseLeaderboard,
+  recomputeCoursePoints, badgesFor, courseLeaderboard, attStateFor,
 };

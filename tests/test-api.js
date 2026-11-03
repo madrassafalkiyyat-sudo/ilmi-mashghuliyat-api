@@ -514,6 +514,73 @@ test('course attendance: courseReg counts as registration; verified claim adds +
   assert.ok(board.data.leaderboard.some((b) => b.totalPoints >= 10));
 });
 
+test('course gradebook: ONE attendance rule — code/manual/pending/none states agree on every surface', async () => {
+  const d = await db();
+  const sid = 'gb-sess-1';
+  await d.collection('courseSessions').insertOne({
+    _id: sid, sessionId: sid, sessionDate: '2026-10-26', startTime: '20:00', endTime: '21:30',
+    title: 'ادارہ سازی کورس — گریڈ بک ٹیسٹ کلاس', isCourseSession: true, courseBatch: 'b1',
+  });
+  const mk = async (id, email, extra) => {
+    await d.collection('users').insertOne(Object.assign({
+      _id: id, uid: id, email, name: 'GB ' + id, status: 'approved', role: 'student', courseReg: true,
+    }, extra || {}));
+  };
+  await mk('gb-code', 'gb-code@example.com');
+  await mk('gb-man', 'gb-man@example.com');
+  await mk('gb-pend', 'gb-pend@example.com');
+  await mk('gb-none', 'gb-none@example.com');
+  await mk('gb-store', 'gb-store@example.com', { sessionAtts: { [sid]: true } });
+  const claim = (email, status, source) => Object.assign({
+    _id: sid + ':' + email, id: sid + ':' + email, sessionId: sid, email,
+    name: 'GB', sessionTitle: 'ٹیسٹ', code: '***', date: new Date().toISOString(), status,
+  }, source ? { source } : {});
+  await d.collection('attendanceClaims').insertMany([
+    claim('gb-code@example.com', 'تصدیق شدہ'),
+    claim('gb-man@example.com', 'تصدیق شدہ', 'manual'),
+    claim('gb-pend@example.com', 'زیرِ جائزہ'),
+  ]);
+  const adminTok = await login('admin@example.com', 'adminpass123');
+  const gb = await call('/api/course/admin/gradebook', { token: adminTok });
+  assert.equal(gb.status, 200);
+  const sIdx = gb.data.sessions.findIndex((s) => s.sessionId === sid);
+  assert.ok(sIdx >= 0, 'fixture session must appear in the gradebook');
+  const row = (e) => gb.data.rows.find((r) => r.email === e);
+  assert.deepEqual([row('gb-code@example.com').att[sIdx], row('gb-code@example.com').attState[sIdx]], [true, 'code']);
+  assert.deepEqual([row('gb-man@example.com').att[sIdx], row('gb-man@example.com').attState[sIdx]], [true, 'manual']);
+  assert.deepEqual([row('gb-store@example.com').att[sIdx], row('gb-store@example.com').attState[sIdx]], [true, 'manual'],
+    'a user-doc-only admin entry must count present (manual)');
+  assert.deepEqual([row('gb-pend@example.com').att[sIdx], row('gb-pend@example.com').attState[sIdx]], [false, 'pending'],
+    'an unverified claim is its own state — never blank-as-absent, never counted present');
+  assert.deepEqual([row('gb-none@example.com').att[sIdx], row('gb-none@example.com').attState[sIdx]], [false, '']);
+  assert.equal(row('gb-code@example.com').attCount, 1);
+  assert.equal(row('gb-pend@example.com').attCount, 0);
+  assert.equal(row('gb-pend@example.com').attPend, 1);
+  // The per-session attendance endpoint must tell the same story.
+  const att = await call('/api/course/admin/attendance/' + sid, { token: adminTok });
+  assert.equal(att.status, 200);
+  const has = (list, e) => (att.data[list] || []).some((x) => x.email === e);
+  assert.ok(has('present', 'gb-code@example.com') && has('present', 'gb-man@example.com') && has('present', 'gb-store@example.com'));
+  assert.equal((att.data.present.find((x) => x.email === 'gb-store@example.com') || {}).legacy, true);
+  assert.ok(has('pending', 'gb-pend@example.com') && !has('absent', 'gb-pend@example.com'));
+  assert.ok(has('absent', 'gb-none@example.com') && !has('present', 'gb-none@example.com'));
+  // A user-doc-only presence earns its +10 on recompute (the points union).
+  const course = require('../src/lib/course');
+  const pts = await course.recomputeCoursePoints(d, 'gb-store@example.com');
+  assert.equal(pts.attendanceCount, 1);
+  assert.equal(pts.attendancePoints, 10);
+  // Verification moves pending -> present(code) everywhere and pays +10.
+  const ver = await call('/api/attendance/verify', { method: 'POST', token: adminTok, body: { claimId: sid + ':gb-pend@example.com', verified: true } });
+  assert.equal(ver.status, 200);
+  const gb2 = await call('/api/course/admin/gradebook', { token: adminTok });
+  const row2 = gb2.data.rows.find((r) => r.email === 'gb-pend@example.com');
+  assert.equal(row2.attState[sIdx], 'code');
+  assert.equal(row2.attCount, 1);
+  assert.equal(row2.attPend, 0);
+  const cp = await d.collection('coursePoints').findOne({ _id: 'gb-pend@example.com' });
+  assert.equal(cp.attendanceCount, 1, 'verify must recompute course points (+10)');
+});
+
 test('admin-login: admin WITHOUT a users doc gets a passwordless session (refresh rotates, logout revokes)', async () => {
   const d = await db();
   await d.collection('admins').insertOne({ _id: 'boss@example.com' });
