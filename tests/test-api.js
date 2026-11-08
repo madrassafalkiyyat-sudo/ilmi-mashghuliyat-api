@@ -556,13 +556,31 @@ test('course form claims: claim -> grade (clamp 10) -> gradebook; manual + remov
   // Plan values: forms 10, in-app 20.
   assert.ok(course.releasePlan().filter((p) => p.type === 'google-form').every((p) => p.maxMarks === 10));
   assert.ok(course.releasePlan().filter((p) => p.type === 'in-app').every((p) => p.maxMarks === 20));
+  // New release days (Mufti 2026-11-05): session 2 (Mon 2026-11-09) ->
+  // form 1 Tue +1, form 2 Thu +3, activity Sat +5, all 09:00 Karachi;
+  // deadline unchanged (next Mon 20:00 Karachi).
+  const s2 = Object.fromEntries(course.releasePlan().filter((p) => p.session === 2).map((p) => [p.kind, p]));
+  assert.equal(s2.form1.releaseAtMs, Date.parse('2026-11-10T09:00:00+05:00'));
+  assert.equal(s2.form2.releaseAtMs, Date.parse('2026-11-12T09:00:00+05:00'));
+  assert.equal(s2.activity.releaseAtMs, Date.parse('2026-11-14T09:00:00+05:00'));
+  assert.equal(s2.activity.deadlineMs, Date.parse('2026-11-16T20:00:00+05:00'));
+  // Mufti 2026-11-05: every slide activity carries the FULL in-app
+  // explanation from ACTIVITY_INSTRUCTIONS (never the old generic
+  // 'read the slides in the folder' text).
+  const acts = course.releasePlan().filter((p) => p.type === 'in-app');
+  assert.ok(acts.length === 9); // sessions 1-6, 8, 9, 10 (7 has none)
+  for (const a of acts) {
+    assert.equal(a.instructions, course.ACTIVITY_INSTRUCTIONS[a.session]);
+    assert.ok(a.instructions.includes('🧭 پس منظر') && a.instructions.includes('📤 جمع کرانے کی صورت'));
+    assert.ok(!a.instructions.includes('سلائیڈز کھول کر'));
+  }
   // Backfill: an existing plan form assignment stored with maxMarks 0 heals.
   await d.collection('assignments').insertOne({
     _id: 'asg-b1-f2-s2', id: 'asg-b1-f2-s2', course: 'idara-b1', auto: true, kind: 'form2',
     title: 'heal fixture', type: 'google-form', formUrl: 'https://docs.google.com/forms/d/xyz/viewform',
-    releaseAtMs: Date.parse('2026-11-11T09:00:00+05:00'), deadlineMs: Date.parse('2026-11-16T20:00:00+05:00'), maxMarks: 0,
+    releaseAtMs: Date.parse('2026-11-12T09:00:00+05:00'), deadlineMs: Date.parse('2026-11-16T20:00:00+05:00'), maxMarks: 0,
   });
-  const rr = await course.runCourseReleases(d, Date.parse('2026-11-11T10:00:00+05:00'));
+  const rr = await course.runCourseReleases(d, Date.parse('2026-11-12T10:00:00+05:00'));
   assert.ok((rr.healed || []).includes('asg-b1-f2-s2'), 'healed list carries the fixture');
   assert.equal((await d.collection('assignments').findOne({ _id: 'asg-b1-f2-s2' })).maxMarks, 10);
   // The form-system notice is exactly-once per registered student.
