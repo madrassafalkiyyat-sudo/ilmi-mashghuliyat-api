@@ -4,18 +4,53 @@
 // module warm; see OPEN-DECISIONS.md for host notes).
 const { MongoClient } = require('mongodb');
 const config = require('./config');
-const { ensureNotificationIndexes } = require('./lib/notify');
 
 let client = null;
 let db = null;
+let monitorStarted = false;
+let pingFails = 0;
 
 async function getDb() {
   if (db) return db;
-  client = new MongoClient(config.mongoUri, { serverSelectionTimeoutMS: 10000 });
+  // Bounded timeouts (2026-11-08): a stalled database call must fail in
+  // seconds, never hang a request (or the whole process) forever.
+  client = new MongoClient(config.mongoUri, {
+    serverSelectionTimeoutMS: 8000,
+    socketTimeoutMS: 20000,
+    maxPoolSize: 10,
+  });
   await client.connect();
   db = client.db(config.dbName);
   await ensureIndexes(db);
+  startMonitor();
   return db;
+}
+
+// Self-heal (2026-11-08): ping the database every minute; after two
+// consecutive failures, drop the client so the next getDb() reconnects
+// fresh instead of every request queueing behind a dead connection.
+function startMonitor() {
+  if (monitorStarted) return;
+  monitorStarted = true;
+  const t = setInterval(async () => {
+    if (!db) return;
+    try {
+      await db.command({ ping: 1 });
+      pingFails = 0;
+    } catch (e) {
+      pingFails++;
+      console.error('mongo ping failed (' + pingFails + '):', e && e.message);
+      if (pingFails >= 2) {
+        const c = client;
+        client = null;
+        db = null;
+        pingFails = 0;
+        if (c) c.close().catch(() => {});
+        console.error('mongo client reset — next request reconnects');
+      }
+    }
+  }, 60000);
+  if (t.unref) t.unref();
 }
 
 // Indexes that enforce the app's standing rules at the database level.
@@ -23,11 +58,6 @@ async function ensureIndexes(db) {
   await db.collection('users').createIndex({ email: 1 }, { unique: true });
   await db.collection('users').createIndex({ uid: 1 }, { unique: true, sparse: true });
   await db.collection('admins').createIndex({ _id: 1 });
-  // /auth/refresh and /auth/logout look sessions up by token hash.
-  await db.collection('users').createIndex({ 'refreshTokens.hash': 1 });
-  await db.collection('admins').createIndex({ 'refreshTokens.hash': 1 });
-  // Own notifications newest first + automatic expiry (see lib/notify).
-  await ensureNotificationIndexes(db);
   // Exactly-once notifications: one document per (user, notification id).
   await db.collection('notifications').createIndex({ email: 1, id: 1 }, { unique: true, sparse: true });
   // One attendance claim per student per session.
