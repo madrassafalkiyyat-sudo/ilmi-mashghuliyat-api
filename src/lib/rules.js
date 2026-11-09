@@ -162,11 +162,12 @@ function attendanceWindow(session, nowMs) {
   // it. (The generic path below keeps its stored times + 30-minute grace
   // for one-off live sessions.)
   if (session.courseBatch || session.isCourseSession) {
-    // Karachi wall clock written with its fixed +05:00 offset — parsing
-    // '20:00Z' here was the 2026-11-09 bug: the window opened at 20:00 UTC
-    // (01:00 Karachi) and the whole live class saw «وقت شروع نہیں ہوا».
-    const cStart = Date.parse(`${d}T20:00:00+05:00`);
-    const cEnd = Date.parse(`${d}T22:00:00+05:00`);
+    // NOTE (2026-11-09): `now` here is karachiNowMs() — the Karachi WALL
+    // reading re-based as UTC ms — so the bounds are parsed as plain wall
+    // times ('Z') to compare wall-to-wall. Do NOT add a +05:00 offset:
+    // that double-shifts the bounds and closes the window during class.
+    const cStart = Date.parse(`${d}T20:00:00Z`);
+    const cEnd = Date.parse(`${d}T22:00:00Z`);
     if (now < cStart) return { open: false, msg: 'حاضری کا وقت ابھی شروع نہیں ہوا' };
     if (now >= cEnd) return { open: false, msg: 'حاضری کا وقت ختم ہو چکا ہے' };
     return { open: true, msg: '' };
