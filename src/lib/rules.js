@@ -162,6 +162,14 @@ function attendanceWindow(session, nowMs) {
   // it. (The generic path below keeps its stored times + 30-minute grace
   // for one-off live sessions.)
   if (session.courseBatch || session.isCourseSession) {
+    // Emergency force-open (Mufti's direct order, class 2 night 2026-11-09):
+    // a session doc may carry attForceOpen:'YYYY-MM-DD' — on that Karachi
+    // date the window stays open all day, so no student is shut out by any
+    // window arithmetic while the class is being run.
+    if (session.attForceOpen) {
+      const p = karachiParts(new Date());
+      if (session.attForceOpen === `${p.year}-${p.month}-${p.day}`) return { open: true, msg: '' };
+    }
     // NOTE (2026-11-09): `now` here is karachiNowMs() — the Karachi WALL
     // reading re-based as UTC ms — so the bounds are parsed as plain wall
     // times ('Z') to compare wall-to-wall. Do NOT add a +05:00 offset:

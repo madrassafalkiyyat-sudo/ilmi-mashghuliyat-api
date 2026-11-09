@@ -222,6 +222,9 @@ async function seedCourseBatch(db) {
       sessionDate: s.date, startTime: '20:00', endTime: '21:30',
       when: `${s.date} — رات 8:00 تا 9:30 (پاکستانی وقت)`,
       isCourseSession: true, courseBatch: 'b1', week: s.n, cat: s.cat,
+      // Class 2 only (2026-11-09): attendance force-open for the whole
+      // Karachi day — Mufti's order after the window confusion in class.
+      ...(s.n === 2 ? { attForceOpen: '2026-11-09' } : {}),
       materialUrl: s.folderUrl,
       points: (cc && cc.points) || [],
       seededAt: now,
