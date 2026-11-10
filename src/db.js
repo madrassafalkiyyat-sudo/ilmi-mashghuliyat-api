@@ -22,8 +22,35 @@ async function getDb() {
   await client.connect();
   db = client.db(config.dbName);
   await ensureIndexes(db);
+  await seedAdmins(db);
   startMonitor();
   return db;
+}
+
+// Admin roster (Mufti's standing list; leverify.ws018@gmail.com added on
+// his order, 2026-11-10). Admin identity comes ONLY from this collection
+// (see lib/rules.js isAdmin), and no API route writes it — so the roster
+// is seeded here at connect time. $setOnInsert ONLY: an existing admin
+// doc (which carries live refresh-token hashes) is never overwritten.
+const ADMIN_EMAILS = [
+  'mh417884@gmail.com',
+  'madrassa.falkiyyat@gmail.com',
+  'raza.ul.mustafa@gmail.com',
+  'madrassa.lectures@gmail.com',
+  'madrassa.mukhtarat@gmail.com',
+  'anamzaidi170@gmail.com',
+  'abrarhussain.73@gmail.com',
+  'leverify.ws018@gmail.com',
+];
+
+async function seedAdmins(db) {
+  for (const email of ADMIN_EMAILS) {
+    await db.collection('admins').updateOne(
+      { _id: email },
+      { $setOnInsert: { _id: email, email, seededAt: new Date().toISOString() } },
+      { upsert: true }
+    );
+  }
 }
 
 // Self-heal (2026-11-08): ping the database every minute; after two
