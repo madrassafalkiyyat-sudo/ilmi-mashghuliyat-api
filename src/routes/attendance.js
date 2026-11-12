@@ -114,10 +114,13 @@ router.post('/claim', async (req, res) => {
   const db = await getDb();
   const user = await db.collection('users').findOne({ _id: req.user._id });
   const session = await db.collection('courseSessions').findOne({ sessionId });
-  // Registration: the per-session map OR the legacy boolean. For a COURSE
-  // session, course registration itself is the registration (a registered
-  // course student is enrolled in every class of the batch).
-  const registered = (user.sessionRegs && user.sessionRegs[sessionId]) || user.sessionReg === true
+  // Registration: the per-session map ONLY. The legacy sessionReg boolean
+  // names no session — it stayed true for 23-Oct registrants, so it let
+  // them claim a new session's attendance without registering (reported
+  // by Mufti, 2026-11-12). For a COURSE session, course registration
+  // itself is the registration (a registered course student is enrolled
+  // in every class of the batch).
+  const registered = (user.sessionRegs && user.sessionRegs[sessionId])
     || !!(session && user.courseReg);
   if (!registered) return fail(res, 403, 'not_registered', 'پہلے سیشن میں رجسٹریشن کریں، پھر حاضری درج ہوگی');
   const live = !session && await db.collection('settings').findOne({ _id: 'session' });
