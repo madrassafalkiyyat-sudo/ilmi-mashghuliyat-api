@@ -269,6 +269,26 @@ test('vision API: approving vision auto-approves a pending student only', async 
   assert.equal(after.status, 'approved');
 });
 
+test('group-joined: confirm persists on the server doc (gate stops repeating)', async () => {
+  const d = await db();
+  await seedUser({
+    _id: 'gj-1', uid: 'gj-1', email: 'groupjoined@example.com',
+    name: 'GroupJoined', status: 'approved', role: 'student', profile: {},
+  });
+  const token = await login('groupjoined@example.com', 'newpass123').catch(async () => {
+    await call('/api/auth/re-register', { method: 'POST', body: { email: 'groupjoined@example.com', password: 'newpass123' } });
+    return login('groupjoined@example.com', 'newpass123');
+  });
+  const before = await d.collection('users').findOne({ _id: 'gj-1' });
+  assert.equal(before.groupJoined, undefined);
+  const r = await call('/api/users/me/group-joined', { method: 'POST', token, body: {} });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.groupJoined, true);
+  const after = await d.collection('users').findOne({ _id: 'gj-1' });
+  assert.equal(after.groupJoined, true);
+  assert.ok(after.groupJoinedAt);
+});
+
 test('profile gate reads both top-level and profile fields (migrated shape)', async () => {
   const { profileMissing } = require('../src/lib/rules');
   const complete = {

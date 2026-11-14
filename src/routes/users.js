@@ -71,6 +71,21 @@ router.post('/me/vision', async (req, res) => {
   return res.json({ review: r.review, status: r.status });
 });
 
+// POST /api/users/me/group-joined — WhatsApp group gate confirmation.
+// (2026-11-14 fix): the gate's confirm used to set groupJoined only in the
+// browser's local copy — the api-bridge never forwarded it (not a routed
+// field), so the next server re-sync wiped it and the gate reappeared on
+// every login, for old students above all (their docs never had the flag).
+// Now the confirm is stored on the server doc; the gate reads it from /me
+// on every boot, so one confirm sticks forever.
+router.post('/me/group-joined', async (req, res) => {
+  const db = await getDb();
+  await db.collection('users').updateOne(
+    { _id: req.user._id }, { $set: { groupJoined: true, groupJoinedAt: new Date().toISOString() } }
+  );
+  return res.json({ ok: true, groupJoined: true });
+});
+
 // POST /api/users/me/password — set/change own password (logged-in only).
 router.post('/me/password', async (req, res) => {
   const { password } = req.body || {};
